@@ -314,12 +314,92 @@ matters (static linking). This could be improved by using a `.cmake` export or
 - **aspect-build/aspect-cli aspect-build/aspect-cli aspect-build/aspect-cli**: Various projects have compiled LLVM to wasm for
   educational/playground purposes (Compiler Explorer, Godbolt, etc.)
 
+## LLVM Wasm Build Caching
+
+The LLVM wasm build (Stage 1) takes ~40 minutes. A caching system avoids
+rebuilding when nothing has changed. The cache packs the essential artifacts
+(~102MB gzip, ~200MB zstd) and can be stored locally, on an HTTP server, or
+in GCS.
+
+### Cache key
+
+The tarball filename encodes the inputs that determine the build output:
+
+```
+llvm-wasm-{LLVM_VERSION}-emsdk{EMSDK_VERSION}-{TARGETS}-{BUILD_TYPE}-{FLAGS_HASH}.tar.gz
+```
+
+Example: `llvm-wasm-20.1.2-emsdk5.0.2-WebAssembly_X86-MinSizeRel-17f32eeb.tar.gz`
+
+### What's in the tarball
+
+```
+lib/*.a                  # 158 static libraries (~444 MB uncompressed)
+lib/cmake/{llvm,clang,lld}/  # CMake package configs
+include/                 # Generated LLVM headers
+tools/clang/include/     # Generated Clang headers (~17 MB)
+tools/lld/include/       # Generated LLD headers (~16 KB)
+.cache_metadata          # Original paths for fixup on restore
+```
+
+### Path fixup
+
+The LLVM cmake configs contain hardcoded build paths. On restore, the cache
+script rewrites these paths using the metadata file, so the cache works even
+when restored to a different directory. It also handles LLVM source tree path
+changes (if `--llvm-src` differs between save and restore).
+
+### Usage with build.sh
+
+```bash
+# First build: builds LLVM from source, saves cache
+./wasm/build.sh --llvm-src /opt/llvm-project --cache-dir /opt/wasm-cache --run-test
+
+# Subsequent containers: restores from cache (~10 sec), skips LLVM build
+./wasm/build.sh --llvm-src /opt/llvm-project --cache-dir /opt/wasm-cache --run-test
+
+# HTTP-hosted cache (download-only, e.g. GitHub Release)
+./wasm/build.sh --llvm-src /opt/llvm-project --cache-url https://example.com/cache --run-test
+
+# GCS bucket (bidirectional)
+./wasm/build.sh --llvm-src /opt/llvm-project --cache-gcs gs://bucket/prefix --run-test
+```
+
+### Standalone cache management
+
+```bash
+# Print cache key (for CI scripts, debugging)
+./wasm/llvm-wasm-cache.sh key --llvm-version 20.1.2 --emsdk-version 5.0.2 --targets "WebAssembly;X86"
+
+# Save existing build to cache
+./wasm/llvm-wasm-cache.sh save --build-dir /opt/llvm-wasm-build \
+    --llvm-version 20.1.2 --emsdk-version 5.0.2 --targets "WebAssembly;X86" \
+    --cache-dir /opt/wasm-cache
+
+# Restore (tries local, then HTTP, then GCS)
+./wasm/llvm-wasm-cache.sh restore --build-dir /opt/llvm-wasm-build \
+    --llvm-src /opt/llvm-project \
+    --llvm-version 20.1.2 --emsdk-version 5.0.2 --targets "WebAssembly;X86" \
+    --cache-dir /opt/wasm-cache
+```
+
+### Container setup recipe
+
+For a new container that needs the Halide wasm build:
+
+1. Install prerequisites: Emscripten SDK, native LLVM 20, cmake, ninja
+2. Clone LLVM source (just a `git clone --depth 1 --branch llvmorg-20.1.2`)
+3. Run `./wasm/build.sh --llvm-src ... --cache-dir /opt/wasm-cache --run-test`
+   - Cache hit: LLVM restores in ~10 sec, Halide builds in ~5 min
+   - Cache miss: LLVM builds in ~40 min, then auto-saves for next time
+
 ## Directory Layout
 
 ```
 Halide/
 ├── wasm/
 │   ├── build.sh              # Multi-stage build orchestrator
+│   ├── llvm-wasm-cache.sh    # Cache save/restore/key helper
 │   └── test_halide_wasm.cpp  # Smoke test (3 tests)
 ├── build-halide-wasm/        # (not checked in) Halide wasm build output
 │   ├── src/libHalide.a       # 39 MB wasm static library

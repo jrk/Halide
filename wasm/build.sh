@@ -22,6 +22,9 @@
 #   --build-dir DIR       Build output directory (default: build-wasm)
 #   --jobs N              Parallel build jobs (default: nproc)
 #   --llvm-targets LIST   LLVM targets to build (default: all)
+#   --cache-dir DIR       Local directory for LLVM wasm build cache
+#   --cache-url URL       HTTP URL prefix for cached LLVM build (restore only)
+#   --cache-gcs URI       GCS bucket URI for LLVM build cache (gs://bucket/prefix)
 #   --skip-llvm           Skip LLVM build (reuse existing)
 #   --skip-halide         Skip Halide build
 #   --run-test            Run the smoke test after building
@@ -39,13 +42,16 @@ NATIVE_LLVM=""
 BUILD_DIR="${HALIDE_SRC}/build-wasm"
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 LLVM_TARGETS="all"
+CACHE_DIR=""
+CACHE_URL=""
+CACHE_GCS=""
 SKIP_LLVM=false
 SKIP_HALIDE=false
 RUN_TEST=false
 CLEAN=false
 
 usage() {
-    head -n 34 "$0" | tail -n +3 | sed 's/^# \?//'
+    head -n 37 "$0" | tail -n +3 | sed 's/^# \?//'
     exit 0
 }
 
@@ -60,6 +66,9 @@ while [[ $# -gt 0 ]]; do
         --build-dir)    BUILD_DIR="$2"; shift 2 ;;
         --jobs)         JOBS="$2"; shift 2 ;;
         --llvm-targets) LLVM_TARGETS="$2"; shift 2 ;;
+        --cache-dir)    CACHE_DIR="$2"; shift 2 ;;
+        --cache-url)    CACHE_URL="$2"; shift 2 ;;
+        --cache-gcs)    CACHE_GCS="$2"; shift 2 ;;
         --skip-llvm)    SKIP_LLVM=true; shift ;;
         --skip-halide)  SKIP_HALIDE=true; shift ;;
         --run-test)     RUN_TEST=true; shift ;;
@@ -124,6 +133,17 @@ LLVM_WASM_BUILD="${BUILD_DIR}/llvm"
 HALIDE_WASM_BUILD="${BUILD_DIR}/halide"
 TEST_BUILD="${BUILD_DIR}/test"
 
+# Detect version strings for cache key computation
+EMSDK_VERSION="$(emcc --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")"
+
+# Cache helper flags (passed through to llvm-wasm-cache.sh)
+CACHE_ARGS=()
+[[ -n "${CACHE_DIR}" ]] && CACHE_ARGS+=(--cache-dir "${CACHE_DIR}")
+[[ -n "${CACHE_URL}" ]] && CACHE_ARGS+=(--cache-url "${CACHE_URL}")
+[[ -n "${CACHE_GCS}" ]] && CACHE_ARGS+=(--cache-gcs "${CACHE_GCS}")
+HAS_CACHE_BACKEND=false
+[[ -n "${CACHE_DIR}" || -n "${CACHE_URL}" || -n "${CACHE_GCS}" ]] && HAS_CACHE_BACKEND=true
+
 # ============================================================================
 # Stage 1: Build LLVM for wasm32
 # ============================================================================
@@ -133,57 +153,95 @@ if ! ${SKIP_LLVM}; then
     [[ -d "${LLVM_SRC}/llvm/CMakeLists.txt" ]] || [[ -f "${LLVM_SRC}/llvm/CMakeLists.txt" ]] || \
         die "Invalid LLVM source tree: ${LLVM_SRC}/llvm/CMakeLists.txt not found"
 
-    log "Stage 1: Building LLVM for wasm32 (targets: ${LLVM_TARGETS})"
-    log "  Source: ${LLVM_SRC}/llvm"
-    log "  Build:  ${LLVM_WASM_BUILD}"
-    log "  This will take a while..."
+    # Detect LLVM version from source
+    LLVM_VERSION="$(git -C "${LLVM_SRC}" describe --tags --match 'llvmorg-*' 2>/dev/null \
+        | sed 's/llvmorg-//' || echo "unknown")"
+    log "LLVM source version: ${LLVM_VERSION}"
+    log "Emscripten version: ${EMSDK_VERSION}"
 
-    # Check for native tablegen tools
-    TBLGEN_FLAGS=""
-    if [[ -x "${NATIVE_LLVM_TBLGEN}" ]]; then
-        TBLGEN_FLAGS="-DLLVM_TABLEGEN=${NATIVE_LLVM_TBLGEN}"
-        log "  Using native llvm-tblgen: ${NATIVE_LLVM_TBLGEN}"
-    else
-        log "  WARNING: Native llvm-tblgen not found at ${NATIVE_LLVM_TBLGEN}"
-        log "  The build will attempt to build and run tablegen, which may fail."
+    # Try to restore LLVM build from cache
+    LLVM_FROM_CACHE=false
+    if ${HAS_CACHE_BACKEND}; then
+        log "Stage 1: Checking LLVM wasm build cache..."
+        if "${SCRIPT_DIR}/llvm-wasm-cache.sh" restore \
+                --build-dir "${LLVM_WASM_BUILD}" \
+                --llvm-src "${LLVM_SRC}" \
+                --llvm-version "${LLVM_VERSION}" \
+                --emsdk-version "${EMSDK_VERSION}" \
+                --targets "${LLVM_TARGETS}" \
+                "${CACHE_ARGS[@]}"; then
+            log "Stage 1: LLVM restored from cache"
+            LLVM_FROM_CACHE=true
+        else
+            log "Stage 1: Cache miss, will build from source"
+        fi
     fi
 
-    if [[ -x "${NATIVE_CLANG_TBLGEN}" ]]; then
-        TBLGEN_FLAGS="${TBLGEN_FLAGS} -DCLANG_TABLEGEN=${NATIVE_CLANG_TBLGEN}"
-        log "  Using native clang-tblgen: ${NATIVE_CLANG_TBLGEN}"
+    if ! ${LLVM_FROM_CACHE}; then
+        log "Stage 1: Building LLVM for wasm32 (targets: ${LLVM_TARGETS})"
+        log "  Source: ${LLVM_SRC}/llvm"
+        log "  Build:  ${LLVM_WASM_BUILD}"
+        log "  This will take a while..."
+
+        # Check for native tablegen tools
+        TBLGEN_FLAGS=""
+        if [[ -x "${NATIVE_LLVM_TBLGEN}" ]]; then
+            TBLGEN_FLAGS="-DLLVM_TABLEGEN=${NATIVE_LLVM_TBLGEN}"
+            log "  Using native llvm-tblgen: ${NATIVE_LLVM_TBLGEN}"
+        else
+            log "  WARNING: Native llvm-tblgen not found at ${NATIVE_LLVM_TBLGEN}"
+            log "  The build will attempt to build and run tablegen, which may fail."
+        fi
+
+        if [[ -x "${NATIVE_CLANG_TBLGEN}" ]]; then
+            TBLGEN_FLAGS="${TBLGEN_FLAGS} -DCLANG_TABLEGEN=${NATIVE_CLANG_TBLGEN}"
+            log "  Using native clang-tblgen: ${NATIVE_CLANG_TBLGEN}"
+        fi
+
+        emcmake cmake -S "${LLVM_SRC}/llvm" -B "${LLVM_WASM_BUILD}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS}" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            ${TBLGEN_FLAGS} \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_BUILD_UTILS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_LIBPFM=OFF \
+            -DLLVM_ENABLE_THREADS=OFF \
+            -DLLVM_ENABLE_PIC=OFF \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_BACKTRACES=OFF \
+            -DLLVM_ENABLE_CRASH_OVERRIDES=OFF \
+            -DLLVM_ENABLE_UNWIND_TABLES=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCLANG_BUILD_TOOLS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_DOCS=OFF
+
+        cmake --build "${LLVM_WASM_BUILD}" -j "${JOBS}"
+
+        log "Stage 1 complete: LLVM wasm libraries built"
+
+        # Save to cache for future use
+        if ${HAS_CACHE_BACKEND}; then
+            log "Stage 1: Saving LLVM build to cache..."
+            "${SCRIPT_DIR}/llvm-wasm-cache.sh" save \
+                --build-dir "${LLVM_WASM_BUILD}" \
+                --llvm-version "${LLVM_VERSION}" \
+                --emsdk-version "${EMSDK_VERSION}" \
+                --targets "${LLVM_TARGETS}" \
+                "${CACHE_ARGS[@]}" || \
+                log "WARNING: Failed to save cache (non-fatal)"
+        fi
     fi
-
-    emcmake cmake -S "${LLVM_SRC}/llvm" -B "${LLVM_WASM_BUILD}" -G Ninja \
-        -DCMAKE_BUILD_TYPE=MinSizeRel \
-        -DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS}" \
-        -DLLVM_ENABLE_PROJECTS="clang;lld" \
-        ${TBLGEN_FLAGS} \
-        -DLLVM_BUILD_TOOLS=OFF \
-        -DLLVM_BUILD_UTILS=OFF \
-        -DLLVM_INCLUDE_TESTS=OFF \
-        -DLLVM_INCLUDE_BENCHMARKS=OFF \
-        -DLLVM_INCLUDE_EXAMPLES=OFF \
-        -DLLVM_INCLUDE_DOCS=OFF \
-        -DLLVM_ENABLE_TERMINFO=OFF \
-        -DLLVM_ENABLE_ZLIB=OFF \
-        -DLLVM_ENABLE_ZSTD=OFF \
-        -DLLVM_ENABLE_LIBXML2=OFF \
-        -DLLVM_ENABLE_LIBEDIT=OFF \
-        -DLLVM_ENABLE_LIBPFM=OFF \
-        -DLLVM_ENABLE_THREADS=OFF \
-        -DLLVM_ENABLE_PIC=OFF \
-        -DLLVM_ENABLE_ASSERTIONS=OFF \
-        -DLLVM_ENABLE_BACKTRACES=OFF \
-        -DLLVM_ENABLE_CRASH_OVERRIDES=OFF \
-        -DLLVM_ENABLE_UNWIND_TABLES=OFF \
-        -DBUILD_SHARED_LIBS=OFF \
-        -DCLANG_BUILD_TOOLS=OFF \
-        -DCLANG_INCLUDE_TESTS=OFF \
-        -DCLANG_INCLUDE_DOCS=OFF
-
-    cmake --build "${LLVM_WASM_BUILD}" -j "${JOBS}"
-
-    log "Stage 1 complete: LLVM wasm libraries built"
 else
     log "Skipping Stage 1 (LLVM build)"
     [[ -d "${LLVM_WASM_BUILD}" ]] || die "LLVM wasm build not found at ${LLVM_WASM_BUILD}. Run without --skip-llvm first."
