@@ -119,8 +119,27 @@ function(tests)
 
         add_executable("${TARGET}" "${file}")
         target_link_libraries("${TARGET}" PRIVATE Halide::Test Halide::TerminateHandler)
-        if ("${file}" MATCHES ".cpp$")
+
+        if (EMSCRIPTEN)
+            target_link_options("${TARGET}" PRIVATE
+                "SHELL:-s NODERAWFS=1"
+                "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+                "SHELL:-s INITIAL_MEMORY=536870912"
+                "SHELL:-s STACK_SIZE=8388608"
+                "SHELL:-s NO_EXIT_RUNTIME=0"
+                "SHELL:-s ENVIRONMENT=node"
+            )
+            if (Halide_ENABLE_EXCEPTIONS)
+                target_link_options("${TARGET}" PRIVATE "-fwasm-exceptions")
+                target_compile_options("${TARGET}" PRIVATE "-fwasm-exceptions")
+            endif ()
+        endif ()
+
+        if ("${file}" MATCHES ".cpp$" AND NOT EMSCRIPTEN)
             target_precompile_headers("${TARGET}" REUSE_FROM _test_internal)
+        elseif ("${file}" MATCHES ".cpp$")
+            # Skip PCH under Emscripten — em++ PCH reuse across targets
+            # is unreliable in cross-compilation.
         endif ()
 
         if (args_EXPECT_FAILURE)

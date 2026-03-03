@@ -6,6 +6,7 @@
 #   Stage 1: Build LLVM static libraries for wasm32
 #   Stage 2: Cross-compile Halide for wasm32
 #   Stage 3: Build and optionally run a smoke test
+#   Stage 4: Build and run the correctness test suite (optional)
 #
 # Prerequisites:
 #   - Emscripten SDK (emsdk) installed and activated (emcc/em++ on PATH)
@@ -25,6 +26,9 @@
 #   --skip-llvm           Skip LLVM build (reuse existing)
 #   --skip-halide         Skip Halide build
 #   --run-test            Run the smoke test after building
+#   --run-tests           Build and run the correctness test suite
+#   --test-filter REGEX   CTest filter for test names (default: ".*")
+#   --test-jobs N         Parallel CTest jobs (default: 1)
 #   --clean               Remove build directory before starting
 #   --help                Show this help message
 #
@@ -42,10 +46,13 @@ LLVM_TARGETS="all"
 SKIP_LLVM=false
 SKIP_HALIDE=false
 RUN_TEST=false
+RUN_TESTS=false
+TEST_FILTER=".*"
+TEST_JOBS=1
 CLEAN=false
 
 usage() {
-    head -n 34 "$0" | tail -n +3 | sed 's/^# \?//'
+    head -n 38 "$0" | tail -n +3 | sed 's/^# \?//'
     exit 0
 }
 
@@ -63,6 +70,9 @@ while [[ $# -gt 0 ]]; do
         --skip-llvm)    SKIP_LLVM=true; shift ;;
         --skip-halide)  SKIP_HALIDE=true; shift ;;
         --run-test)     RUN_TEST=true; shift ;;
+        --run-tests)    RUN_TESTS=true; shift ;;
+        --test-filter)  TEST_FILTER="$2"; shift 2 ;;
+        --test-jobs)    TEST_JOBS="$2"; shift 2 ;;
         --clean)        CLEAN=true; shift ;;
         --help|-h)      usage ;;
         *)              die "Unknown option: $1" ;;
@@ -200,6 +210,36 @@ if ! ${SKIP_HALIDE}; then
     log "  Native clang:   ${NATIVE_CLANG}"
     log "  Native llvm-as: ${NATIVE_LLVM_AS}"
 
+    # Determine whether to enable the WABT wasm JIT backend and tests.
+    # WABT requires C++ exceptions; we use Emscripten's native wasm exceptions
+    # (-fwasm-exceptions) which have near-zero overhead on non-throwing paths.
+    if ${RUN_TESTS}; then
+        log "  Tests enabled: building with WABT + wasm exceptions"
+        EXCEPTION_FLAGS="-fwasm-exceptions"
+        WASM_BACKEND_FLAGS=(
+            -DHalide_WASM_BACKEND=wabt
+            -DHalide_ENABLE_EXCEPTIONS=ON
+        )
+        TEST_FLAGS=(
+            -DWITH_TESTS=ON
+            -DWITH_TEST_CORRECTNESS=ON
+            -DWITH_TEST_ERROR=OFF
+            -DWITH_TEST_WARNING=OFF
+            -DWITH_TEST_PERFORMANCE=OFF
+            -DWITH_TEST_GENERATOR=OFF
+            -DWITH_TEST_RUNTIME=OFF
+            -DWITH_TEST_FUZZ=OFF
+            -DHalide_TARGET=wasm-32-wasmrt
+        )
+    else
+        EXCEPTION_FLAGS=""
+        WASM_BACKEND_FLAGS=(-DHalide_WASM_BACKEND=OFF)
+        TEST_FLAGS=(-DWITH_TESTS=OFF)
+    fi
+
+    CFLAGS="${EXCEPTION_FLAGS}" \
+    CXXFLAGS="${EXCEPTION_FLAGS}" \
+    LDFLAGS="${EXCEPTION_FLAGS}" \
     emcmake cmake -S "${HALIDE_SRC}" -B "${HALIDE_WASM_BUILD}" -G Ninja \
         -DCMAKE_BUILD_TYPE=MinSizeRel \
         -DBUILD_SHARED_LIBS=OFF \
@@ -208,7 +248,8 @@ if ! ${SKIP_HALIDE}; then
         -DLLD_DIR="${LLVM_WASM_BUILD}/lib/cmake/lld" \
         -DHalide_NATIVE_CLANG="${NATIVE_CLANG}" \
         -DHalide_NATIVE_LLVM_AS="${NATIVE_LLVM_AS}" \
-        -DWITH_TESTS=OFF \
+        "${WASM_BACKEND_FLAGS[@]}" \
+        "${TEST_FLAGS[@]}" \
         -DWITH_TUTORIALS=OFF \
         -DWITH_AUTOSCHEDULERS=OFF \
         -DWITH_PYTHON_BINDINGS=OFF \
@@ -263,6 +304,32 @@ if ${RUN_TEST} || [[ -f "${HALIDE_WASM_BUILD}/src/libHalide.a" ]]; then
         node "${TEST_BUILD}/test_halide_wasm.js" && \
             log "Smoke test PASSED" || \
             log "Smoke test FAILED"
+    fi
+fi
+
+# ============================================================================
+# Stage 4: Build and run the correctness test suite
+# ============================================================================
+
+if ${RUN_TESTS}; then
+    log "Stage 4: Building correctness tests"
+    cmake --build "${HALIDE_WASM_BUILD}" --target build_correctness -j "${JOBS}"
+
+    log "Stage 4: Running correctness tests"
+    cd "${HALIDE_WASM_BUILD}"
+    ctest -L correctness \
+        -j "${TEST_JOBS}" \
+        --timeout 600 \
+        --output-on-failure \
+        -R "${TEST_FILTER}" \
+        2>&1 | tee "${BUILD_DIR}/test-results.log"
+
+    TEST_EXIT=${PIPESTATUS[0]}
+    if [[ ${TEST_EXIT} -eq 0 ]]; then
+        log "All correctness tests PASSED"
+    else
+        log "Some correctness tests FAILED (exit code: ${TEST_EXIT})"
+        log "See ${BUILD_DIR}/test-results.log for details"
     fi
 fi
 

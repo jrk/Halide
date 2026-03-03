@@ -1,5 +1,13 @@
 # Plan: Get Correctness Tests Running in the Wasm Build
 
+## Progress
+
+- [x] Step 1: Modify `wasm/build.sh` — enable WABT, exceptions, `--run-tests`
+- [x] Step 2: Modify `cmake/HalideTestHelpers.cmake` — Emscripten link flags for tests
+- [x] Step 3: Modify `test/CMakeLists.txt` — Emscripten flags for `_test_internal`, PCH guard
+- [x] Step 4: Modify `test/correctness/CMakeLists.txt` — exclusion list and timeouts
+- [ ] Verification: build and run tests (requires Emscripten + wasm LLVM build)
+
 ## Context
 
 The Halide compiler can be cross-compiled to WebAssembly via Emscripten and run under Node.js (`wasm/build.sh`). Currently only 3 smoke tests pass (AOT-only, using `compile_to_bitcode`). The full test suite is disabled (`-DWITH_TESTS=OFF`). We want the ~280 correctness tests running.

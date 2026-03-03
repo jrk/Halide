@@ -476,3 +476,27 @@ set_tests_properties(correctness_mul_div_mod
                      correctness_vector_math
                      correctness_vector_reductions
                      PROPERTIES RUN_SERIAL TRUE)
+
+# Emscripten/wasm-specific: disable tests that cannot work in a wasm-hosted
+# environment, and set generous timeouts for the WABT interpreter.
+if (EMSCRIPTEN)
+    set(_wasm_excluded_tests
+        correctness_load_library                # dlopen/dlsym not available
+        correctness_custom_auto_scheduler       # requires shared library loading
+        correctness_input_larger_than_two_gigs  # >2GB allocation in wasm32
+        correctness_output_larger_than_two_gigs
+        correctness_realize_larger_than_two_gigs
+    )
+    foreach (_test IN LISTS _wasm_excluded_tests)
+        if (TEST ${_test})
+            set_tests_properties(${_test} PROPERTIES DISABLED TRUE)
+        endif ()
+    endforeach ()
+
+    # WABT interpretation is ~100-1000x slower than native, plus the wasm
+    # host adds another ~2-5x. Set a generous per-test timeout.
+    get_property(_all_correctness_tests DIRECTORY PROPERTY TESTS)
+    foreach (_test IN LISTS _all_correctness_tests)
+        set_tests_properties(${_test} PROPERTIES TIMEOUT 600)
+    endforeach ()
+endif ()
