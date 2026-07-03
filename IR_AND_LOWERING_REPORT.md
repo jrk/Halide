@@ -1,1131 +1,1222 @@
-# Halide's IRs and Lowering — A Deep-Dive Report
+# How Halide Represents and Compiles Programs
 
-*Research report based on Halide main (July 2026, post-LLVM-22, commit ~3cf47df). All
-`file:line` references are into `src/` of this tree. The report has three goals:*
+*A deep-dive report based on reading the Halide source at main (July 2026). File and
+line references point into `src/` of this tree. The report has three goals:*
 
-1. *Document the three representations (functional frontend, schedule-as-data,
-   imperative Stmt IR) and the two lowering phases that connect them, at
-   re-implementation-grade detail.*
-2. *Provide a blueprint for a standalone "Halide lite" recreation (§7).*
-3. *Analyze exactly what is entangled inside the initial lowering step, to ground
-   proposals for reifying a mid-level IR and making that step incremental (§8).*
-
----
-
-## 1. The big picture
-
-Halide's compiler has **two IR layers plus a schedule metadata layer**, connected by a
-single monolithic pass (`schedule_functions`) followed by ~60 smaller passes:
-
-```
-  Func / Function / Definition            (functional layer: DAG of defs, no loops)
-      + FuncSchedule / StageSchedule      (schedule: pure metadata, no IR)
-      │
-      │  schedule_functions (ScheduleFunctions.cpp)     ← "the big step"
-      ▼
-  Stmt with For/Realize/Provide/Call(Halide)/ProducerConsumer,
-  loop bounds = dangling symbolic variables ("f.s0.x.min")
-      │
-      │  bounds_inference, sliding_window, storage_folding, ...
-      ▼
-  same node types, bounds now concrete Exprs (LetStmt-defined)
-      │
-      │  storage_flattening                              ← "the phase transition"
-      ▼
-  Stmt with Allocate/Store/Load, flat 1-D indices
-      │
-      │  vectorize / unroll / partition / cleanup / task outlining ...
-      ▼
-  LoweredFunc(s) in a Module  →  CodeGen_LLVM / CodeGen_C
-```
-
-Three facts shape everything:
-
-- **The same `Expr` node types are used at every level.** A `Func` definition's RHS is
-  an `Expr` in which references to other Funcs are `Call` nodes with
-  `CallType::Halide`. There is no separate frontend expression AST.
-- **The schedule is never IR.** Every directive (`split`, `vectorize`, `compute_at`,
-  `compute_with`, ...) only edits small structs (`Split`, `Dim`, `LoopLevel`, ...)
-  hanging off each `Function`. Lowering *interprets* this data.
-- **The "mid-level IR" (Realize/Provide/Call-Halide + symbolic bounds) is real but
-  transient**: it exists only as the output of `schedule_functions` and is consumed by
-  `storage_flattening`. It is never constructible per-Func; §8 is about changing that.
+1. *Explain, from first principles, the data structures Halide uses to represent
+   programs — the functional front end, the schedule, and the imperative
+   intermediate representation — and the two compilation phases that connect them.*
+2. *Give a blueprint for building a small, clean "Halide lite" from scratch (§9).*
+3. *Analyze what is tangled together inside Halide's first big lowering step, as
+   groundwork for a proposal to make that step incremental (§10).*
 
 ---
 
-## 2. The functional frontend layer
+## 1. The core idea, and the shape of the compiler
 
-### 2.1 Function / FunctionContents
+Halide is built around one central idea: **separate what you compute from how you
+organize the computation**. A Halide program has two parts:
 
-`Func` (Func.h) is user-facing sugar over `Internal::Function`, which is a handle
-(`FunctionPtr`) to a refcounted `FunctionContents` (Function.cpp:63–175):
+- The **algorithm**: a set of function definitions like "the blurred image at pixel
+  (x, y) is the average of the input at (x−1, y), (x, y), and (x+1, y)". This says
+  what every value *is*, as pure math. It says nothing about loops, memory, or
+  order of evaluation.
+- The **schedule**: a separate set of instructions like "compute the blur in tiles
+  of 64×64, vectorize the innermost loop by 8, and parallelize across rows". This
+  says how to organize the work, and *cannot change the result* — only the speed.
 
-```cpp
-struct FunctionContents {
-    std::string name;                 // unique pipeline-wide (no '.')
-    std::string origin_name;          // pre-wrapper name (Func::in / clone_in)
-    std::vector<Type> output_types;   // one per tuple element
-    std::vector<std::string> args;    // names of the pure dims (LHS of pure def)
-    FuncSchedule func_schedule;       // function-wide schedule (§4.1)
-    Definition init_def;              // the pure definition
-    std::vector<Definition> updates;  // update definitions, in order
-    std::vector<Parameter> output_buffers;         // one per tuple element
-    // extern-definition state: extern_function_name, extern_arguments,
-    //   extern_mangling, extern_function_device_api, extern_proxy_expr
-    // tracing flags, debug_file, frozen flag, optional type/dim constraints
-};
+The compiler's job is to combine the two into an ordinary imperative program —
+loops, arrays, loads, and stores — and hand that to a code generator.
+
+To do this, Halide uses three distinct representations of a program, and the whole
+compiler is the story of moving between them:
+
+```
+ 1. The functional front end               "g(x) = f(x) + f(x+1)"
+    (a graph of definitions; no loops)
+         +
+    The schedule                           "compute f inside g's loop over x"
+    (plain data attached to each function)
+         │
+         │   Phase 1: schedule_functions + bounds inference
+         ▼
+ 2. Mid-level imperative IR                loops + "realize f", "f(x) = ...",
+    (loops over multi-dimensional          calls to f(x) by coordinate
+     values; sizes still symbolic)
+         │
+         │   Phase 2: storage flattening + ~50 more passes
+         ▼
+ 3. Low-level imperative IR                loops + malloc/free + loads and
+    (flat memory, explicit addresses)      stores at computed addresses
+         │
+         ▼
+    Code generation (LLVM, C, GPU, ...)
 ```
 
-Key mechanics:
+"IR" here means *intermediate representation*: the in-memory data structure the
+compiler manipulates, as opposed to source text or machine code. "Lowering" means
+translating a higher-level representation into a lower-level one.
 
-- **Group-based memory management.** `FunctionContents` live inside a refcounted
-  `FunctionGroup` (Function.cpp:177–180); `FunctionPtr` (FunctionPtr.h:27–88) is
-  either strong (owns the group) or weak (raw pointer + index). Within-group
-  references must be weak; this is how self-referential updates (`f(x) = f(x)+1`) and
-  mutually-referential wrappers avoid refcount cycles. `define_update` runs a
-  `WeakenFunctionPtrs` mutator over new args/values to weaken self-calls
-  (Function.cpp:833–846).
-- **Tuples are parallel vectors, not a type.** A tuple-valued Func has N entries in
-  `Definition::values`, `output_types`, `output_buffers`; a caller reading element *i*
-  is a `Call` with `value_index = i`. `split_tuples` (late in lowering) renames them
-  to `f.0`, `f.1`, ... buffers.
-- **Freezing.** Defining `g` freezes every Function `g` calls
-  (Function.cpp:281–300), so a producer can't be redefined after a consumer captured
-  it.
+Three design decisions shape everything else in the codebase, so it's worth
+stating them up front:
 
-### 2.2 Definition / DefinitionContents
+1. **One expression language spans all three levels.** The right-hand side of a
+   function definition ("f(x) + f(x+1)") and the address arithmetic in the final
+   machine-level program are built from the *same* expression node types. What
+   changes across levels is which *statement* forms are allowed and how a
+   reference to another function is represented — not the expression language
+   itself.
+2. **The schedule is never a program.** Calling `f.vectorize(x, 8)` does not
+   transform anything. It just records a note in a struct attached to `f`. All
+   the actual transformation happens later, when lowering *interprets* those
+   notes. This makes schedules cheap to build, inspect, and serialize, at the
+   cost of concentrating all the transformation logic in one big pass.
+3. **The mid-level IR is real but fleeting.** There is a well-defined intermediate
+   world — loops over multi-dimensional values, with symbolic sizes — but it
+   exists only *between* two passes. You cannot build it directly, one function at
+   a time. Section 10 is about changing that.
 
-One `Definition` per stage (Definition.h:38–132):
-
-```cpp
-struct DefinitionContents {
-    bool is_init = true;
-    Expr predicate;                  // RDom where() clauses, default const_true()
-    std::vector<Expr> values, args;  // RHS tuple; LHS coordinates
-    StageSchedule stage_schedule;    // per-stage loop structure (§4.2)
-    std::vector<Specialization> specializations;
-};
-```
-
-- For the **pure (init) definition**, `args` is exactly `[Var(a) for a in
-  Function::args]`. For **updates**, `args` are arbitrary Exprs (`f(x+1)`,
-  `f(r.x)`, ...).
-- The RDom itself is *not* stored on the Definition. At definition time its
-  `ReductionVariable`s (`{name, min, extent}`) are copied into
-  `stage_schedule.rvars()` and its predicate into `predicate`
-  (Definition.cpp:95–107). After that, the schedule is the authoritative record.
-- **Specializations** are nested Definitions: `Specialization {Expr condition;
-  Definition definition; string failure_message;}`. `add_specialization` deep-copies
-  args/values/predicate *and the stage schedule* (Definition.cpp:203–217); subsequent
-  directives on the returned `Stage` edit the copy. Lowering turns the list into a
-  right-leaning if/else-if tree of alternative loop nests.
-
-### 2.3 Defining functions: the purity checks
-
-**`Function::define`** (pure, Function.cpp:547–663), for `f(x, y) = expr`:
-
-1. Reject frozen/extern/undefined cases.
-2. `CheckVars` (Function.cpp:202–278): every `Variable` in the values must be a
-   pure arg, a `Parameter`, `Let`-bound, or an RVar — and for a pure definition, any
-   RVar is an error. Recursive self-calls must use the pure vars in the same positions
-   as the LHS. *Purity is structural, not effect-analysis.*
-3. Freeze callees; CSE each value; tag `random()` calls.
-4. Build `init_def` and the **default schedule**: one serial `PureVar` `Dim` per arg,
-   in arg order (first arg innermost), plus the sentinel dim `__outermost`; one
-   `StorageDim` per arg (Function.cpp:628–644).
-
-**`Function::define_update`** (Function.cpp:679–896):
-
-1. Requires an existing pure def; same dimensionality, tuple size, and per-element
-   types.
-2. LHS arg *i* is "pure" iff it is a naked `Variable` named exactly like pure arg *i*;
-   anything else is an impure coordinate.
-3. `CheckVars` additionally enforces **exactly one ReductionDomain** across args and
-   values, and captures it.
-4. Loop nest seeded as: RVar dims first (innermost), each classified
-   `PureRVar`/`ImpureRVar` by `can_parallelize_rvar` (a race analysis:
-   Function.cpp:851–865), then the pure args, then `__outermost`.
-
-### 2.4 Var, RDom, FuncRef
-
-- **Var** (Var.h) is just a name (with a cached Int(32) `Variable` Expr).
-  `Var::outermost()` = `"__outermost"` is a scheduling sentinel (§4.4).
-- **RDom** wraps a refcounted `ReductionDomain {vector<ReductionVariable>, predicate,
-  frozen}` (Reduction.cpp:94–133); `where()` ANDs predicates. An `RVar` used as an
-  Expr becomes `Variable::make(Int(32), name, reduction_domain)` — the `Variable`
-  node's `reduction_domain` field is how `define_update` discovers which RDom an
-  update touches.
-- **FuncRef** is the "LHS or call?" object from `f(x, y)`. As an Expr it becomes
-  `Call{CallType::Halide, name, args, FunctionPtr, value_index}`
-  (Func.cpp:3390–3399). As an assignment target it routes to
-  `define`/`define_update`. `operator+=` etc. auto-create a base case
-  (`define_base_case`, Func.cpp:3246–3277). Implicit vars: `_` is expanded to
-  `Var::implicit(0..)` to match dimensionality.
-
-So the complete flow for `g(x) = f(x) + 1`: `f(x)` → `Call{Halide, "f",
-[Variable("x")], func=f, value_index=0}`; `+1` wraps it in `Add`; assignment runs
-`Function::define({"x"}, {Add(...)})`, freezing `f`.
-
-### 2.5 Extern stages, Parameters, Buffers
-
-- `define_extern` stores the extern symbol name + `ExternFuncArgument`s and
-  synthesizes a fake init definition with `undef` values and `ForType::Extern` dims —
-  placeholder loops so bounds inference has something to chew on (deleted later by
-  `remove_extern_loops`). Bounds for extern stages use the two-phase *bounds query
-  protocol* (call with null host pointers; the extern fills in what it needs).
-- **Parameter** (Parameter.h) = runtime argument: scalar (type + min/max/estimate
-  constraints) or buffer (per-dim `BufferConstraint {min, extent, stride, ...}`).
-  Appears in the IR embedded in `Variable::param`, `Call::param`, `Load::param`,
-  `Store::param`. A Func's own outputs are Parameters in `output_buffers`.
-- **Buffer<>** = named concrete image; appears as `Call::image`/`Load::image` for
-  compiled-in constants and JIT inputs.
+The rest of this report walks through each representation and each phase in
+enough detail to reimplement them.
 
 ---
 
-## 3. The imperative IR: Expr/Stmt node catalog
+## 2. The expression language
 
-### 3.1 Node infrastructure (Expr.h, IntrusivePtr.h, IRVisitor.h, IRMutator.h)
+### 2.1 What an expression tree is, and how Halide builds one
 
-- **Refcounted, immutable nodes.** `IRNode {virtual accept; mutable RefCount;
-  IRNodeType node_type}` (Expr.h:97–127). Halide builds without C++ RTTI; the
-  `uint8_t` `node_type` tag is the substitute, and `IRHandle::as<T>()` is a tag
-  compare + reinterpret_cast. `IntrusivePtr` is used (not `shared_ptr`) so a counted
-  handle can be recovered from a raw `const IRNode*`.
-- Node lists are generated from two X-macros (`HALIDE_FOR_EACH_IR_EXPR`,
-  Expr.h:28–59; `HALIDE_FOR_EACH_IR_STMT`, Expr.h:62–79). The Expr list is in
-  **canonical strength order** — the simplifier and `IRMatch.h` rely on it.
-- **No hash-consing.** `make()` factories `new` a node each time; `Expr` equality is
-  pointer equality (`same_as`); structural equality is `IREquality.h::equal()`.
-  Because Exprs can still be DAGs (shared subtrees), `IRGraphVisitor`/`IRGraphMutator`
-  memoize visits to avoid exponential blowup.
-- **Visitor/mutator.** `IRVisitor` has one `visit(const T*)` per node (default:
-  recurse). `IRMutator` reconstructs a node **only if a child changed**, preserving
-  sharing. `VariadicVisitor` is a CRTP switch-on-tag dispatcher used by the simplifier
-  for speed.
-- **Type** wraps the runtime `halide_type_t` (code ∈ {Int, UInt, Float, BFloat,
-  Handle}, bits, lanes) + a C++-type pointer for Handle mangling. Vector types are
-  `lanes > 1` and are only created by lowering (vectorization), never by users.
+An expression like `2 * x + 1` is represented as a tree of nodes: an `Add` node
+whose left child is a `Mul` node (children: constant `2`, variable `x`) and whose
+right child is the constant `1`. Every compiler has something like this. Halide's
+version has a few specific properties worth understanding:
 
-Semantic ground rules (IR.h:39–76): signed ints ≥32 bits are "no-overflow" types the
-simplifier treats as unbounded; narrower signed and all unsigned wrap; children of a
-node have no sequence points and may be reordered/duplicated/eliminated; floats follow
-fast-math.
+**Nodes are immutable and reference-counted.** Once built, a node never changes.
+"Modifying" an expression means building a new tree that shares the unchanged
+parts of the old one. Sharing is safe *because* nodes are immutable, and
+reference counting (each node tracks how many pointers refer to it, and frees
+itself when the count hits zero) makes the sharing memory-safe without a garbage
+collector. Halide uses an *intrusive* reference count — the counter lives inside
+the node itself (`IRNode` at Expr.h:97–127) rather than in a separate control
+block — so that a plain raw pointer can always be turned back into an owning
+handle. The handle types are `Expr` (for expressions) and `Stmt` (for
+statements), both thin wrappers around a pointer.
 
-### 3.2 Expr nodes (30)
+**Every node carries a type tag instead of using C++ RTTI.** Each node stores a
+one-byte enum (`IRNodeType`) saying which kind of node it is. Asking "is this an
+Add?" is a tag comparison plus a pointer cast (`Expr::as<Add>()`), which is much
+faster than `dynamic_cast`. The full list of node kinds is generated from a
+macro list (Expr.h:28–79), and the expression kinds are deliberately listed in a
+canonical "strength" order that the simplifier uses to decide which of two
+equivalent forms is preferable.
 
-| Node | Fields | Semantics |
-|---|---|---|
-| IntImm/UIntImm/FloatImm/StringImm | value | Scalar constants (int value normalized to bit width) |
-| Cast | value | Conversion; float→int truncates; casts to wide signed assumed no-overflow |
-| Reinterpret | value | Bit-cast, may change lanes if total bits preserved |
-| Variable | name, Parameter param, Buffer<> image, ReductionDomain rdom | Named symbol; the three handles tie it to what it denotes |
-| Add/Sub/Mul | a, b | Arithmetic |
-| Div/Mod | a, b | **Euclidean** division/remainder; x/0 = 0, x%0 = 0 |
-| Min/Max | a, b | |
-| EQ/NE/LT/LE/GT/GE | a, b | Comparisons (UInt(1)×lanes); GT/GE normalized to LT/LE |
-| And/Or/Not | a, b / a | Boolean |
-| Select | cond, t, f | Ternary; may evaluate both sides; lane-wise |
-| Load | name, predicate, index, image, param, ModulusRemainder alignment | 1-D typed load from untyped byte array; different names assumed non-aliasing. **Post-flattening only** |
-| Ramp | base, stride, lanes | `[base, base+stride, ...]`; dense vector load = Load with stride-1 Ramp index |
-| Broadcast | value, lanes | Splat |
-| Call | name, args, CallType, FunctionPtr func, value_index, image, param | See below |
-| Let | name, value, body | Expression-scoped binding |
-| Shuffle | vectors, indices | Generalized lane permute (interleave/concat/slice classifiers + factories) |
-| VectorReduce | value, op (Add/SaturatingAdd/Mul/Min/Max/And/Or) | Horizontal reduction of adjacent lane groups |
+**Equal-looking expressions are usually distinct objects.** Halide does not
+"hash-cons" (i.e., it does not keep a global table so that building `x + 1`
+twice yields the same pointer). Pointer equality (`same_as`) therefore means
+"literally the same node", and structural equality is a separate deep comparison
+(`IREquality.h`). Trees can still share subtrees when code explicitly reuses an
+`Expr`, so traversal utilities exist that memoize visits to avoid exponential
+blowup on heavily shared graphs (`IRGraphVisitor`, `IRGraphMutator`).
 
-**`Call` is the load-bearing node.** `CallType` ∈:
+**Traversal uses the visitor pattern, and rewriting rebuilds only what changed.**
+An `IRVisitor` has one virtual method per node kind; the default implementation
+just recurses into children. An `IRMutator` is the rewriting version: its default
+for each node visits the children and reconstructs the node *only if some child
+actually changed*, returning the original pointer otherwise. This preservation of
+identity keeps memory use sane and makes "did anything change?" checks cheap.
+Nearly every compiler pass in Halide is a small subclass of one of these two.
 
-- `Halide` — a call to another (or the same) Halide Function; `func` holds a
-  possibly-weak `FunctionPtr`, `value_index` selects the tuple element. **This is the
-  frontend's inter-Func edge** and the mid-level IR's symbolic multi-dim load.
-- `Image` — load from a concrete input image (`image`) or ImageParam (`param`).
-- `Extern` / `ExternCPlusPlus` — external C/C++ function, possibly side-effecting.
-- `PureExtern` — reorderable/CSE-able external function (`sqrt`).
-- `Intrinsic` / `PureIntrinsic` — compiler intrinsics. Halide has no dedicated node
-  types for most ops; ~100 operations are intrinsics named by the `IntrinsicOp` enum
-  (IR.h:607–779): shifts, saturating/widening/halving arithmetic,
-  `likely`/`likely_if_innermost` (loop-partition hints), `if_then_else`, `mux`,
-  `prefetch`, `promise_clamped`/`unsafe_promise_clamped`, `require`, `undef`,
-  `unreachable`, `_halide_buffer_get_*`, strict-float variants, etc.
+**Types are simple.** A `Type` is a code (signed int, unsigned int, float,
+bfloat, or opaque pointer/"handle"), a bit width, and a *lane count* (Type.h). A
+lane count above 1 means a SIMD vector value — e.g. `Int(32, 8)` is eight 32-bit
+integers processed together. Users never write vector types; they appear only
+when the compiler vectorizes a loop.
 
-`Call(Halide)` and `Call(Image)` do not survive lowering — storage flattening
-converts them to `Load`s.
+**The arithmetic has carefully chosen, slightly unusual semantics** (documented
+at IR.h:39–76), because the compiler must be able to *reason* about expressions,
+not just evaluate them:
 
-### 3.3 Stmt nodes (17)
+- Signed integers of 32 bits or more are assumed never to overflow. This lets
+  the simplifier treat them as ideal mathematical integers (e.g. rewrite
+  `x + 1 > x` to true). Narrower signed types and all unsigned types wrap.
+- Division and modulo are *Euclidean*: the remainder is never negative, and
+  division rounds toward negative infinity. This makes interval reasoning
+  (Section 6) much cleaner than C's truncate-toward-zero rules. Division by
+  zero yields zero rather than being undefined — again so that expressions are
+  total functions that analysis can safely move around.
+- Subexpressions may be reordered, duplicated, or dropped freely; there are no
+  sequence points inside an expression. Floating point follows fast-math rules.
 
-| Node | Fields | Semantics / lifetime |
-|---|---|---|
-| LetStmt | name, value, body | Statement-scoped binding |
-| AssertStmt | condition, message | Abort pipeline with error call if false |
-| ProducerConsumer | name, is_producer, body | Marker: where Func `name` is produced vs consumed. Survives to codegen as a no-op scope (used by profiling/tracing) |
-| For | name, **min, max (inclusive!)**, ForType, DeviceAPI, body, Partition | Loop over `[min, max]`; `extent() = max-min+1` (IR.h:973–996 — note: this is a recent change from the historical min/extent pair). ForType ∈ Serial, Parallel, Vectorized, Unrolled, Extern, GPUBlock, GPUThread, GPULane |
-| Acquire | semaphore, count, body | Semaphore wait (async runtime) |
-| Store | name, predicate, value, index, param, alignment | 1-D predicated store; dual of Load. Post-flattening |
-| **Provide** | name, values, args, predicate | Multi-dim symbolic store `f(args) = values`. **Mid-level only** |
-| Allocate | name, type, MemoryType, extents, condition, new_expr, free_function, padding, body | Scoped scratch allocation |
-| Free | name | Free the named allocation |
-| **Realize** | name, types, MemoryType, Region bounds, condition, body | Multi-dim allocation for Func `name`. **Mid-level only** |
-| Block | first, rest | Sequential composition (linked list) |
-| Fork | first, rest | Parallel composition (async producers) |
-| IfThenElse | condition, then, else? | Conditional |
-| Evaluate | value | Evaluate for side effect — the only exactly-once evaluation point |
-| **Prefetch** | name, types, bounds, PrefetchDirective, condition, body | Multi-dim prefetch marker. **Mid-level only** (→ `prefetch` intrinsic) |
-| Atomic | producer_name, mutex_name, body | Atomicity w.r.t. enclosing parallel loops |
-| **HoistedStorage** | name, body | Anchor for `hoist_storage`. **Mid-level only** |
+### 2.2 The expression node kinds
 
-**Mid-level-only nodes** (exist between `schedule_functions` and storage
-flattening/cleanup): `Provide`, `Realize`, `Prefetch`, `HoistedStorage`, plus
-`Call(Halide|Image)`. Codegen only ever sees Load/Store/Allocate/Free/For/LetStmt/
-IfThenElse/Block/Fork/Acquire/Atomic/AssertStmt/Evaluate/ProducerConsumer(-as-marker).
+There are 30 expression node kinds. Most are unsurprising; the interesting ones
+get extra commentary below.
+
+*Constants:* `IntImm`, `UIntImm`, `FloatImm`, `StringImm`.
+
+*Arithmetic and logic:* `Add`, `Sub`, `Mul`, `Div`, `Mod` (Euclidean), `Min`,
+`Max`, the comparisons `EQ NE LT LE GT GE`, and `And`, `Or`, `Not`. `Select` is
+a ternary "if" as a value; unlike C's `?:` it may evaluate both arms, and it
+works elementwise on vectors.
+
+*Conversion:* `Cast` (value conversion) and `Reinterpret` (bit-for-bit
+reinterpretation).
+
+*Binding:* `Let` introduces a named value for use inside a sub-expression, like
+`let t = x*x in t + t`. Names are strings; scoping is handled by the passes that
+walk the tree, using a helper `Scope` class (a stack-of-bindings map).
+
+*Vectors:* `Ramp(base, stride, lanes)` is the vector
+`[base, base+stride, base+2·stride, ...]` — a load whose index is a
+stride-1 ramp is a contiguous vector load, the pattern all vectorization
+revolves around. `Broadcast(value, lanes)` repeats a scalar across lanes.
+`Shuffle` rearranges lanes; `VectorReduce` sums (or mins, maxes, ...) groups of
+adjacent lanes.
+
+*Memory:* `Load(name, index, predicate, ...)` reads one element (scalar or
+vector) from a *named, flat, one-dimensional* buffer at a computed index. Loads
+from different names are assumed not to alias. `Load` belongs to the low-level
+world; it only appears after storage flattening (Section 7.1).
+
+Three node kinds deserve close attention:
+
+**`Variable`** is a reference to a named value — a loop counter, a function
+argument, a `Let` binding, or a runtime parameter. Besides the name, a Variable
+can carry a handle to the thing it denotes: a `Parameter` (a runtime scalar or
+buffer argument), a `Buffer` (a concrete image baked into the program), or a
+`ReductionDomain` (Section 3.4). These embedded handles are how later stages
+know what a name means without a global symbol table — and, as Section 10 and
+the companion modularization report discuss, they are also the main thing
+coupling the expression language to the rest of the system.
+
+**`Call`** is the workhorse. One node kind represents every kind of "function
+application", distinguished by an enum:
+
+- `Halide`: a call to another Halide function *by coordinate* — `f(x, y+1)`
+  means "the value of f at (x, y+1)". This is the multi-dimensional read, and
+  it is how the front end's function graph is knit together: the node holds a
+  pointer to the callee's definition. It does not survive lowering; storage
+  flattening turns it into a `Load`.
+- `Image`: a coordinate read from a concrete input image or image parameter.
+  Also becomes a `Load`.
+- `Extern` / `ExternCPlusPlus`: a call to an outside C/C++ function, possibly
+  with side effects.
+- `PureExtern`: an outside function the compiler may freely reorder, duplicate,
+  or de-duplicate (e.g. `sqrt`).
+- `Intrinsic` / `PureIntrinsic`: operations the compiler itself understands.
+  Rather than defining a node kind for every operation, Halide represents about
+  a hundred operations as intrinsics identified by name (IR.h:607–779):
+  bit-shifts, saturating and widening arithmetic, `if_then_else` (a Select that
+  guarantees only one arm is evaluated), `prefetch`, and several *annotation*
+  intrinsics that exist purely to carry analysis hints — most importantly
+  `likely` (marks a branch as the common case, driving loop partitioning,
+  §7.3) and `promise_clamped` (asserts a value lies in a range, tightening
+  bounds analysis).
+
+**`Let` vs names in general:** everything is bound by string name. Halide keeps
+this manageable with two disciplines: compiler-generated names are made unique
+by a global counter, and one lowering pass (`uniquify_variable_names`) renames
+everything so that, from that point on, textual name equality really means
+"same variable".
+
+### 2.3 The statement node kinds
+
+Statements are things executed for effect, in order. There are 17 kinds. The
+low-level ones look like any imperative language:
+
+- `LetStmt` — bind a name to a value for the duration of a statement (the
+  statement-level version of `Let`).
+- `AssertStmt` — check a condition; on failure call an error routine and abort
+  the pipeline.
+- `For(name, min, max, kind, body)` — a loop. **Note: current Halide stores an
+  inclusive `min` and `max`** (extent = max − min + 1; IR.h:973–996), a recent
+  change from the historical min/extent pair — older papers and docs differ.
+  The `kind` says how iterations relate: `Serial` (in order), `Parallel` (any
+  order, concurrently), `Vectorized` (all at once, in lockstep, as SIMD lanes),
+  `Unrolled` (copies pasted in sequence), plus GPU variants that map iterations
+  onto GPU blocks/threads/lanes. A vectorized or unrolled loop must eventually
+  have a compile-time-constant trip count.
+- `Block` — run one statement, then another (sequencing).
+- `IfThenElse`, `Evaluate` (evaluate an expression for its side effect),
+  `Store(name, value, index, predicate)` (the write-side twin of `Load`),
+  `Allocate`/`Free` (scoped scratch memory with computed extents).
+
+Then there are the **mid-level statements** — the ones that make Halide's
+intermediate world distinctive. They speak in *multi-dimensional coordinates*
+rather than flat memory:
+
+- `Provide(name, values, args)` — "set f at coordinates (args...) to
+  (values...)". A symbolic, multi-dimensional store. The plural `values` is how
+  tuple-valued functions (functions returning several values per point) are
+  handled.
+- `Realize(name, types, bounds, body)` — "for the duration of `body`, there
+  exists storage for function f covering this rectangular region of
+  coordinates". A symbolic, multi-dimensional allocation. Which concrete memory,
+  and at what addresses, is decided later.
+- `ProducerConsumer(name, is_producer, body)` — a marker saying "this region of
+  the program computes f" / "this region uses f". It carries no semantics of
+  its own; it exists so analyses, profilers, and humans can tell which loops
+  belong to which function. It survives to the very end as an inert label.
+- `Prefetch`, `HoistedStorage` — markers for the prefetch and
+  storage-lifting scheduling features; both are dissolved during lowering.
+
+Finally a few specialized ones: `Fork` (run two statements as concurrent
+tasks), `Acquire` (wait on a semaphore — `Fork`/`Acquire` implement
+asynchronous producer-consumer pipelines), and `Atomic` (the body must execute
+atomically with respect to surrounding parallel loops).
+
+**The invariant that defines "lowering" in Halide:** `Provide`, `Realize`,
+`Prefetch`, `HoistedStorage`, and `Call`s of kind `Halide`/`Image` exist only in
+the middle of the pipeline. The code generator never sees them; if one survives
+lowering, that's a compiler bug. Everything else can reach the back end.
 
 ---
 
-## 4. The schedule as data
+## 3. The functional front end
 
-Every directive is *pure metadata mutation* — no IR is transformed at directive time.
-Two objects per Function:
+### 3.1 What a Func is made of
 
-### 4.1 FuncSchedule — "where/how is this Func stored and realized" (Schedule.cpp:233–283)
-
-```cpp
-struct FuncScheduleContents {
-    LoopLevel store_level, compute_level, hoist_storage_level; // all default inlined()
-    std::vector<StorageDim> storage_dims;  // layout: order, alignment, bound, fold
-    std::vector<Bound> bounds;             // bound()/align_bounds() assertions
-    std::vector<Bound> estimates;          // autoscheduler hints
-    std::map<std::string, FunctionPtr> wrappers;   // Func::in()
-    MemoryType memory_type;                // store_in()
-    bool memoized, async;  Expr ring_buffer, memoize_eviction_key;
-};
-```
-
-Directive → field (all in Func.cpp): `compute_at` assigns `compute_level`
-(compute_root = `compute_at(LoopLevel::root())`, compute_inline =
-`compute_at(LoopLevel::inlined())`); `store_at`/`store_root` → `store_level`;
-`hoist_storage`; `reorder_storage` permutes `storage_dims`; `align_storage`/
-`bound_storage`/`fold_storage` set per-dim fields; `bound`/`bound_extent`/
-`align_bounds` push `Bound{var, min, extent, modulus, remainder}` records;
-`set_estimate`; `memoize`; `async`; `ring_buffer`; `store_in`.
-
-**Default schedule = inlined**: `store_level = compute_level = hoist_storage_level =
-LoopLevel::inlined()` at construction.
-
-### 4.2 StageSchedule — "what does this stage's loop nest look like" (Schedule.cpp:297–336)
+When a user writes
 
 ```cpp
-struct StageScheduleContents {
-    std::vector<ReductionVariable> rvars;   // copied from the RDom
-    std::vector<Split> splits;              // ordered transformation log
-    std::vector<Dim> dims;                  // loop list, INNERMOST FIRST, ends with __outermost
-    std::vector<PrefetchDirective> prefetches;
-    FuseLoopLevel fuse_level;               // compute_with: who I'm fused into
-    std::vector<FusedPair> fused_pairs;     // derived: children fused into me
-    bool touched, allow_race_conditions, atomic, override_atomic_associativity_test;
-};
+Func f;  Var x, y;
+f(x, y) = x + y;
 ```
 
-### 4.3 Split, Dim, LoopLevel
+they are building an `Internal::Function` — a reference-counted record
+(`FunctionContents`, Function.cpp:63–175) containing, in essence:
+
+- a globally unique **name**;
+- the list of **argument names** (`{"x", "y"}`) — these are the function's
+  *dimensions*: `f` is defined over an infinite integer grid indexed by (x, y);
+- the **pure definition**: the right-hand-side expression(s), stored as a
+  `Definition`;
+- zero or more **update definitions** (Section 3.3);
+- the **schedule** for the function as a whole (`FuncSchedule`, Section 4);
+- output types, and one output-buffer `Parameter` per returned value;
+- optional machinery for externally-implemented stages, tracing flags, and a
+  "frozen" flag: once some other function's definition has captured `f` as a
+  callee, `f` can no longer be redefined (Function.cpp:281–300). This gives
+  the front end value semantics — a consumer sees the producer as it was when
+  the consumer was written.
+
+A **`Definition`** (Definition.h:38–132) is one "stage" of a function:
+
+- `args`: the left-hand-side coordinates. For the pure definition these are
+  exactly the argument variables. For updates they can be arbitrary expressions.
+- `values`: the right-hand-side expression(s) — plural for tuple-valued
+  functions. There is no tuple type anywhere in the IR; a k-tuple function is
+  just k parallel expression lists, k output types, and callers select an
+  element by index.
+- `predicate`: a boolean guard (from `RDom::where`, Section 3.4).
+- a `StageSchedule` — the per-stage half of the schedule (Section 4).
+- a list of `Specialization`s: pairs of (boolean condition, complete alternate
+  Definition). `f.specialize(cond)` deep-copies the definition *and its
+  schedule* so the copy can be scheduled differently; lowering compiles the
+  list into an if/else-if chain choosing among differently-scheduled versions
+  of the same computation.
+
+### 3.2 How `f(x, y) = expr` becomes data
+
+The expression `f(x, y)` by itself is ambiguous: it might be the left side of a
+definition or a read of `f` inside some other expression. Halide resolves this
+with a small proxy object, `FuncRef`, returned by `Func::operator()`:
+
+- Used as a **value** (converted to `Expr`), it becomes
+  `Call(Halide, "f", {x, y}, pointer-to-f's-definition)` — a by-coordinate
+  read (Func.cpp:3390–3399).
+- **Assigned to**, it calls `Function::define` (first time) or
+  `Function::define_update` (subsequently).
+
+`Function::define` (Function.cpp:547–663) enforces what "pure" means, checks it
+structurally rather than by any clever analysis: every variable appearing on
+the right-hand side must be one of the argument variables, a runtime parameter,
+or bound by a `Let` — and no reduction variables are allowed. It also
+freezes every function the definition calls, runs common-subexpression
+elimination over the values, and — importantly — installs the **default
+schedule** (Section 4.4).
+
+### 3.3 Update definitions: how Halide expresses reductions
+
+A pure definition alone cannot express "sum over a window" or a histogram,
+because each output point would have to be a single closed-form expression.
+Halide's answer is *update definitions*: after the pure definition initializes
+every point, subsequent definitions imperatively revise selected points, in
+order. For example, a histogram:
 
 ```cpp
-struct Split {                       // Schedule.h:332–353
-    std::string old_var, outer, inner;
-    Expr factor;
-    bool exact;                      // true for RVar splits: tail may not over-iterate
-    TailStrategy tail;               // RoundUp, GuardWithIf, Predicate, PredicateLoads,
-                                     // PredicateStores, ShiftInwards, ShiftInwardsAndBlend,
-                                     // RoundUpAndBlend, Auto
-    enum SplitType { SplitVar, RenameVar, FuseVars } split_type;
-};
+histogram(x) = 0;                       // pure: initialize all bins
+RDom r(0, input.width());
+histogram(input(r)) += 1;               // update: walk r, bump bins
 ```
 
-One record type encodes split (`old → outer*factor + inner`), rename, and fuse
-(`outer,inner → old`), in a single ordered list so ordering between them is respected.
-(Note: the historical `PurifyRVar` split type no longer exists in current main.)
+Semantically: run the pure step over whatever region is needed; then run each
+update, iterating its reduction domain serially in order, applying its
+assignment at each point.
 
-```cpp
-struct Dim {                         // Schedule.h:446–491
-    std::string var;
-    ForType for_type;                // Serial/Parallel/Vectorized/Unrolled/Extern/GPU*
-    DeviceAPI device_api;
-    DimType dim_type;                // PureVar | PureRVar | ImpureRVar
-    Partition partition_policy;      // Auto | Never | Always
-};
-```
+`define_update` (Function.cpp:679–896) enforces the rules that make updates
+compilable:
 
-`DimType` encodes legality: `PureVar` (reorder freely, may over-compute), `PureRVar`
-(reorder freely, exact domain), `ImpureRVar` (must run in order; parallelize only via
-associativity proof + `atomic()`, or `allow_race_conditions()`).
+- The update's left-hand-side coordinate in position *i* is "pure" only if it
+  is literally the same variable name as pure argument *i*. Anything else
+  (`f(x+1)`, `f(r)`, `f(g(r))`) makes that position "impure", which constrains
+  scheduling (an impure dimension can't be freely reordered or parallelized).
+- All the reduction variables used must come from **exactly one** `RDom`.
+- Types and dimensionality must match the pure definition.
 
-```cpp
-struct LoopLevelContents {           // Schedule.cpp:20–42
-    std::string func_name;           // "" for inline/root
-    int stage_index;                 // -1 = unspecified
-    std::string var_name;            // "__root" = root(), "" = inlined()
-    bool is_rvar, locked;
-};
-```
+### 3.4 Reduction domains
 
-`LoopLevel` is a *mutable shared handle* until lowering starts:
-`Function::lock_loop_levels()` freezes all of them and implements
-"store_level, if left inlined, follows compute_level; hoist_storage_level follows
-store_level" (Function.cpp:1164–1185) — why `compute_at` alone gives fused
-storage+compute.
+An `RDom` (reduction domain) is an explicit, named iteration space: a list of
+`ReductionVariable`s, each with a name, a min, and an extent, plus an optional
+boolean `where` predicate restricting the domain (Reduction.cpp:94–133). When an
+update definition is created, the RDom's variables are copied into the stage's
+schedule as loop dimensions, and the predicate is stored on the Definition —
+after that moment the schedule, not the RDom object, is the authority.
 
-**compute_with**: `Stage::compute_with` records only a `FuseLoopLevel {LoopLevel,
-map<string, LoopAlignStrategy>}` on the stage being moved. The parent-side
-`FusedPair{func_1, stage_1, func_2, stage_2, var_name}` list is *derived* during
-`realization_order()` by `populate_fused_pairs_list`.
+How does the compiler know which RDom an update uses? Through the expression
+language itself: a reduction variable used in an expression is a `Variable`
+node carrying a pointer to its `ReductionDomain`, and the definition-checking
+visitor simply collects those pointers.
 
-### 4.4 How directives edit the state
+One scheduling subtlety worth naming now: reduction loops are *ordered* by
+default (updates may depend on earlier iterations, as `+=` does), so
+parallelizing or reordering them is illegal unless the compiler can prove the
+update is associative (there is a real associativity prover, used by
+`rfactor` and `atomic()`), or the user explicitly waives safety.
 
-Almost every `Func::` method forwards to `Stage` (the init definition). The important
-ones:
+### 3.5 The pieces around the edges
 
-- **`split(old, outer, inner, factor, tail)`** (Func.cpp:1076–1306): (1) finds the
-  dim by *suffix match* (`var_name_match`: dim names accumulate qualified spellings
-  like `x.xi`); (2) edits `dims` in place — duplicates the entry so `inner` is
-  immediately inside `outer`, both inheriting for_type/dim_type; (3) resolves
-  `TailStrategy::Auto` (RVar → GuardWithIf; update defs → RoundUp/GuardWithIf; pure
-  defs → ShiftInwards, or RoundUp when a prior ShiftInwards split already covers the
-  var); (4) appends the `Split` record. **No IR.**
-- **`fuse`**: erases the outer dim, renames the inner to the fused name, merged
-  DimType = more restrictive, appends a `FuseVars` Split.
-- **`reorder`**: permutes `dims` only; reordering two ImpureRVars requires an
-  associativity proof. `__outermost` must remain last.
-- **`vectorize/unroll/parallel/serial(var)`**: sets `dims[i].for_type` only. The
-  factor forms are literally split + mark (`vectorize(x, 8)` = `split(x, x, xi, 8);
-  vectorize(xi)`).
-- **`tile`** = two splits + one reorder. Nothing more.
-- **`rfactor`** is the one directive that rewrites the *algorithm*: it projects the
-  RDom into two, synthesizes an intermediate Func, and directly assigns
-  `dims`/`rvars`/`splits` on both stages.
-- **GPU**: `gpu_blocks/threads/lanes` just set for_type + device_api on dims; the
-  canonical `.__thread_id_x` names are applied later by lowering's
-  `canonicalize_gpu_vars`, keyed by nesting depth.
+- **`Var`** is nothing but a name with sugar. **`RVar`** is a name plus a
+  pointer into an RDom.
+- **`Parameter`** represents a runtime argument to the compiled pipeline: a
+  scalar (with optional declared range) or a buffer (with optional declared
+  shape/stride constraints the compiler can exploit). Funcs' outputs are
+  themselves buffer Parameters.
+- **`Buffer`** is a concrete, named block of pixel data available at compile
+  time (for JIT execution or baked-in tables).
+- **Extern stages** let a Func be implemented by an outside function (an FFT
+  library, say) instead of Halide expressions. The compiler still needs to
+  reason about what region such a stage reads, which it does via a
+  *bounds-query protocol*: call the extern function with null data pointers
+  and let it fill in what it would need (Section 6.4).
+- Reference-count hygiene: a function that calls itself (every update does)
+  would create a cycle. Halide stores function payloads in shared "groups"
+  and demotes within-group pointers to weak (non-owning) ones
+  (FunctionPtr.h:27–88), a detail any reimplementation must get right or leak.
 
-### 4.5 Worked example
+---
+
+## 4. The schedule: a program's organization, as plain data
+
+### 4.1 What scheduling directives mean
+
+Before looking at the data structures, here is what the main directives *do*,
+stated operationally. Take `f(x, y)` with its natural loop nest `for y { for x
+{ compute f(x,y) } }` (conceptually):
+
+- **`split(x, xo, xi, 8)`**: replace loop x with two nested loops — an outer
+  loop `xo` and an inner loop `xi` of 8 — where `x = xo*8 + xi`. This is the
+  primitive from which tiling is built. It immediately raises the *tail
+  question*: what if the extent isn't divisible by 8? (Section 5.3.)
+- **`fuse(x, y, xy)`**: the inverse — collapse two nested loops into one longer
+  loop.
+- **`reorder(xi, y, xo)`**: permute the loop nesting order.
+- **`vectorize(xi)` / `unroll(xi)` / `parallel(y)`**: change a loop's execution
+  kind (the `ForType` from Section 2.3) without changing its structure.
+- **`tile(x, y, xi, yi, 8, 8)`**: pure sugar — two splits and a reorder.
+- **`compute_at(g, y)`**: place the entire computation of `f` *inside* g's loop
+  over y — so each iteration of that loop computes just the piece of f that
+  iteration needs. This is the locality/recompute lever: computing f in small
+  pieces near its use keeps data in cache but may recompute values needed by
+  several pieces.
+- **`compute_root()`**: compute all of f up front, before anything that uses it.
+- **`store_at(g, y)` / `store_root()`**: choose where f's *storage* lives,
+  independently of where its computation happens. Storage placed outside the
+  compute loop enables reuse across iterations (Section 6.5).
+- **`compute_inline()`** (the default!): don't materialize f at all; substitute
+  its expression into every use, like inlining a function in a conventional
+  compiler.
+
+The remarkable implementation fact: **none of these transform anything when
+called.** Each is a few lines that edit small structs hanging off the Function.
+Lowering later replays those structs. The full catalog:
+
+### 4.2 The per-function schedule
+
+`FuncSchedule` (Schedule.cpp:233–283) answers "where does this function live?":
+
+- `compute_level`, `store_level`, `hoist_storage_level` — three `LoopLevel`s
+  (below). All three default to "inlined".
+- `storage_dims` — the memory layout: the order dimensions are laid out in
+  (innermost = contiguous), plus optional alignment, an explicit size bound,
+  or a *fold factor* (Section 6.5) per dimension. Set by `reorder_storage`,
+  `align_storage`, `bound_storage`, `fold_storage`.
+- `bounds` — user promises/requirements about region sizes (`bound`,
+  `align_bounds`); `estimates` — non-binding size hints for autoschedulers.
+- `wrappers`, `memoized`, `async`, `ring_buffer`, `memory_type` — the
+  wrapper-function (`Func::in`), memoization, and asynchronous-execution
+  features.
+
+A **`LoopLevel`** (Schedule.h:203–309) names a place in the eventual loop nest:
+"function g, stage s, loop variable v", or one of two special values, *root*
+(outside everything) and *inlined*. It is a mutable shared handle so libraries
+can hand one out and decide its value later; at the start of lowering all
+LoopLevels are locked, and two defaulting rules are applied: an unset store
+level follows the compute level, and an unset hoist-storage level follows the
+store level (Function.cpp:1164–1185).
+
+### 4.3 The per-stage schedule
+
+Each Definition owns a `StageSchedule` (Schedule.cpp:297–336) answering "what
+does this stage's loop nest look like?". Its two central fields:
+
+**`dims` — the loop list.** One `Dim {var, for_type, device_api, dim_type,
+partition_policy}` per loop, ordered **innermost first**, always ending with a
+sentinel pseudo-loop named `__outermost` (so schedules can name the place
+outside all real loops, and so there's a stable anchor for inserting new outer
+loops). `for_type` is the execution kind (serial/parallel/vectorized/...).
+`dim_type` records what reordering is legal: a *pure* dimension can be
+reordered and even over-computed freely; a *pure reduction* dimension can be
+reordered but must cover exactly its domain; an *impure reduction* dimension
+must run serially in order unless associativity is proven or safety is waived.
+
+**`splits` — the transformation log.** An ordered list of `Split {old_var,
+outer, inner, factor, exact, tail, kind}` records, where kind is split, rename,
+or fuse. (The historical fourth kind, `PurifyRVar`, no longer exists.) Order
+matters: lowering replays the log left to right. Directives like `vectorize(x,
+8)` are literally implemented as `split(x, x, xi, 8)` followed by marking the
+new inner dim vectorized (Func.cpp:1665–1702).
+
+Also on the stage schedule: the copied reduction variables (`rvars`), prefetch
+directives, the `compute_with` fusion state (below), and the race-condition
+waiver flags (`allow_race_conditions`, `atomic`).
+
+`compute_with` — a rarely-used but architecturally interesting directive that
+interleaves the loop nests of two *sibling* functions (fusing their loops
+without either consuming the other) — is recorded as a `FuseLoopLevel` on the
+stage being moved; the inverse `FusedPair` records are derived onto the parent
+stage later, during realization ordering.
+
+### 4.4 The default schedule, and a worked example
+
+When a pure definition is created (Function.cpp:628–644): one serial, pure
+`Dim` per argument, in argument order — so the *first* argument is the
+*innermost* loop — plus `__outermost`; storage laid out in the same order; and
+all three loop levels inlined. **The default is full inlining**, not
+compute-root. For pipeline outputs, lowering rewrites "inlined" to "root".
+Update stages get their reduction variables as the innermost dims, then the
+pure LHS variables, then `__outermost`.
+
+Worked example — after:
 
 ```cpp
 f(x, y) = x + y;
 f.tile(x, y, xi, yi, 8, 8).vectorize(xi).parallel(y);
 ```
 
-Final schedule state:
+the schedule data is:
 
 ```
-dims:   x.xi        Vectorized  PureVar     (innermost)
-        y.yi        Serial      PureVar
-        x.x         Serial      PureVar
-        y.y         Parallel    PureVar
-        __outermost Serial      PureVar
-splits: SplitVar(x -> x.x * 8 + x.xi, ShiftInwards)
-        SplitVar(y -> y.y * 8 + y.yi, ShiftInwards)
+dims:   x.xi        Vectorized   (innermost)
+        y.yi        Serial
+        x.x         Serial
+        y.y         Parallel
+        __outermost Serial
+splits: split(x -> x.x * 8 + x.xi, tail = ShiftInwards)
+        split(y -> y.y * 8 + y.yi, tail = ShiftInwards)
 ```
 
-Lowering replays this into `parallel y.y { serial x.x { serial y.yi { vectorized
-x.xi { ... } } } }`.
-
-The sentinel `__outermost` dim (zero-extent anchor "outside all real loops") exists so
-schedules can name that site (e.g. `gpu_single_thread`) and so rfactor has a stable
-insertion point; its degenerate loops are stripped at the end of schedule_functions.
+Note the naming: when `x` is split, the children are named `x.xi` and `x.x` —
+names accumulate their history as dot-separated prefixes, and later lookups
+match by *suffix*. This works, but it is one of the string-typed conventions a
+clean reimplementation should replace (Section 9.1).
 
 ---
 
-## 5. Initial lowering: schedule_functions + bounds inference
+## 5. Phase 1a: building loops (`schedule_functions`)
 
-The front half of `lower_impl()` (Lower.cpp:137). Everything here operates on a
-**deep copy** of the Function DAG (Lower.cpp:151) so user Funcs are never mutated.
+Now the heart of the compiler: combining the functional program with the
+schedule to produce the first imperative program. Everything here is in
+Lower.cpp (the driver) and ScheduleFunctions.cpp.
 
-### 5.1 Environment construction (before any Stmt exists)
+### 5.1 Setting the table
 
-1. **`build_environment`** (FindCalls.cpp:96): transitively collect every Function
-   reachable from the outputs by walking `Call(Halide)` nodes, plus extern-def Func
-   args and schedule wrappers.
-2. **`lock_loop_levels`**, `lower_target_query_ops`, `strictify_float`.
-3. **`wrap_func_calls`** (WrapCalls.cpp:72–177): implements `Func::in()` by
-   substituting `FunctionPtr`s inside caller definitions — per-caller for custom
-   wrappers, global otherwise, composing chained wrappers.
-4. **`realization_order`** (RealizationOrder.cpp:295–421): returns (a) a flat
-   topological order of Functions, (b) `fused_groups` — connected components of the
-   compute_with adjacency, in order. compute_with pairs are validated (no data
-   dependence between fused Funcs in either direction, no cycles); the DAG uses dummy
-   per-group nodes so all inputs of a group precede the whole group; edge lists are
-   sorted by a stable name+visitation key so the order is deterministic.
-5. **`simplify_specializations`**.
+Before any statement exists, the driver (Lower.cpp:137–178):
 
-### 5.2 schedule_functions: the driver (ScheduleFunctions.cpp:2565–2630)
+1. **Deep-copies the whole function graph**, so lowering can mutate schedules
+   without corrupting the user's objects.
+2. Collects the **environment** — every function reachable from the outputs, by
+   walking `Call(Halide)` nodes (FindCalls.cpp).
+3. Applies **wrapper substitution** (`Func::in`, WrapCalls.cpp) and locks all
+   LoopLevels.
+4. Computes the **realization order** (RealizationOrder.cpp:295–421): a
+   topological order of the functions (producers before consumers), plus the
+   grouping of `compute_with`-fused functions, with careful tie-breaking so
+   the order is deterministic run to run.
 
-The initial Stmt is a synthetic zero-trip loop named like `LoopLevel::root()` — so
-`compute_root` is *just a special case of `compute_at`* (the root loop's name matches
-root LoopLevels). Then, iterating **fused groups in reverse realization order**
-(consumers first, so each producer is injected into the partially built consumer
-nest):
+### 5.2 The trick that makes it all compose: symbolic bounds
 
-- **`validate_schedule`**: runs `ComputeLegalSchedules` — an IRVisitor over the
-  *current partial Stmt* that records the stack of enclosing For loops at every use of
-  the Function and intersects them; the requested hoist/store/compute levels must
-  appear in that common stack outside-in, with no parallel loop between store and
-  compute levels. (On failure it prints the legal `compute_at` sites.)
-- If the group is a single pure Func with `compute_level().is_inlined()` →
-  **`inline_function`** (§5.6). Note inlining is decided *here*, before any loops for
-  that Func exist.
-- Otherwise → **`InjectFunctionRealization`** mutates the Stmt (§5.4).
+Here is the key design idea, worth absorbing before the mechanics.
 
-Finally the dummy root loop is peeled off and degenerate `__outermost` loops removed.
+When Halide builds the loop nest for a function `f`, **it does not yet know how
+big the loops should be**. How much of `f` is needed depends on who consumes it
+and where it was placed — which may itself be inside loops whose bounds aren't
+known yet. So loop bounds are emitted as *named placeholders*: the loop over
+f's x dimension runs from symbol `f.s0.x.loop_min` to `f.s0.x.loop_max`, which
+are defined (by trivial `let`s) in terms of symbols `f.s0.x.min` and
+`f.s0.x.max` — which are **deliberately left undefined**. ("s0" = stage 0, the
+pure definition; updates are s1, s2, ....)
 
-### 5.3 One Definition → one loop nest
+These dangling names form a *contract*: a later pass (bounds inference, Section
+6) will compute the required region of every function at every point in the
+program and insert `let` statements defining exactly these names. Because the
+contract is "free variables with agreed names", loop nests can be built
+independently and grafted into each other before anyone knows any sizes. The
+same trick is used for storage: a `Realize` node's extents are symbols like
+`f.x.min_realized` / `f.x.extent_realized`, satisfied later by allocation
+bounds inference.
 
-**`build_provide_loop_nest`** (ScheduleFunctions.cpp:470–545):
+This works, and it is the mechanism that makes the whole architecture hang
+together. Its weakness — the contract is invisible, string-typed, and
+satisfiable only by one global pass — is the subject of Section 10.
 
-- The stage **prefix** is `"<func>.s<stage>."` (`f.s0.` pure, `f.s1.` first update);
-  all schedule vars are qualified with it (`x` → `f.s0.x`).
-- Seed statement: `Provide::make(f, values, site, const_true())` — for a pure def the
-  site is the qualified args; for an update, whatever the LHS args are. Wrapped in
-  `Atomic` if scheduled atomic.
-- `build_loop_nest` produces the default nest; **specializations** then each
-  recursively build their own complete nest from their own Definition, composed as a
-  right-leaning `IfThenElse` chain with the default as the final else.
+### 5.3 Building one stage's loop nest
 
-**`build_loop_nest`** (ScheduleFunctions.cpp:184–467), working inside-out from the
-Provide:
+`build_provide_loop_nest` (ScheduleFunctions.cpp:470–545) turns one Definition
+into a loop nest, from the inside out:
 
-1. **Apply splits** in schedule order via `apply_split` (ApplySplit.cpp:14–166), each
-   returning actions applied to the statement: whole-body substitutions,
-   Call-only/Provide-only substitutions, `Let` wrappers, `if` predicates, and
-   Provide-value blends. Tail strategies:
-   - *RoundUp*: nothing extra — the outer bound `(extent+factor-1)/factor` overruns
-     and the producer's realization is enlarged to match.
-   - *GuardWithIf / Predicate*: substitute `old_var` with a `.guarded` let defined as
-     `promise_clamped(old_var, old_min, old_max)` (so bounds inference knows the true
-     range despite the overrun), and wrap the body in `if (likely(old_var <=
-     old_max))`.
-   - *PredicateLoads/PredicateStores*: same, but the condition goes into
-     `if_then_else` around Calls / ANDed into the Provide predicate.
-   - *ShiftInwards*: `base = min(likely_if_innermost(base), old_max + 1 - factor)` —
-     the last outer iteration slides backward; `likely_if_innermost` later triggers
-     loop partitioning into steady state + tail.
-   - *Blend variants*: additionally mask re-stored values with
-     `select(cond, new, f(args))`.
-   - `compute_loop_bounds_after_split` emits the loop-bound lets: split loops are
-     zero-based (`inner ∈ [0, factor-1]`, `outer ∈ [0, ceil(extent/factor)-1]`) and
-     rebased onto real coordinates by a `.base` let.
-2. **For containers** are created from the `dims` list (outermost-first), interleaved
-   with the lets/ifs the splits produced.
-3. **compute_with guards**: dims at/inside the fusion point get `likely(var >=
-   loop_min) && likely(var <= loop_max)` guards, because fused siblings iterate the
-   *union* of bounds.
-4. **RDom `where()` predicates** become `if (likely(...))` containers.
-5. **Container sorting**: three insertion-sort passes push pure lets and guards as far
-   outward as dependences allow. This is *not* generic LICM — it exists solely so
-   bounds inference's `BoxesTouched` sees the `likely` conditions at the outermost
-   scope and computes tight bounds. (§8 flags this as a design smell a clean redesign
-   should fix structurally.)
-6. **Rewrap**: each `For` gets bounds `Variable(prefix + dim + ".loop_min" /
-   ".loop_max")`; then in reverse split order the split-bound lets are emitted;
-   `__outermost` gets `loop_min = loop_max = 0`; finally for each pure arg `v`:
-   `let f.s0.v.loop_min = f.s0.v.min; let f.s0.v.loop_max = f.s0.v.max`, and RVar
-   loops likewise reference `f.s1.r.min/.max`.
+**Start with the store.** The seed is a `Provide` node: for the pure stage of
+`f(x, y) = x + y`, conceptually `f(f.s0.x, f.s0.y) = f.s0.x + f.s0.y` — the
+definition with every variable renamed to its qualified loop name.
 
-**The `.min`/`.max` symbols are left dangling on purpose.** They are the contract that
-bounds inference will later fulfill with LetStmts. This string-named symbolic contract
-is the composition mechanism of the whole system.
+**Replay the split log** (`apply_split`, ApplySplit.cpp:14–166). Each split
+record turns into substitutions and wrappers around the statement: for
+`split(x, xo, xi, 8)`, substitute `x → xo*8 + xi + min` and record how the new
+loops' bounds derive from the old one's (inner runs 0..7; outer runs
+0..ceil(extent/8)−1). Here the **tail strategies** are implemented — the
+answers to "extent not divisible by 8":
 
-### 5.4 Injection: matching LoopLevels against the growing Stmt
+- **RoundUp**: let the loops overrun to the next multiple of 8; the producer's
+  storage and computed region are simply enlarged to match. Fast, but only
+  legal when computing extra points is harmless (pure stages into internal
+  storage).
+- **GuardWithIf**: overrun the loops, but wrap the body in
+  `if (x <= x_max)` so the extra iterations do nothing. Always legal; the
+  branch cost is later mostly eliminated by loop partitioning. The
+  implementation also substitutes a `promise_clamped` annotation so bounds
+  analysis knows `x` never actually exceeds its true max despite the loop
+  overrunning.
+- **ShiftInwards** (default for pure stages): make the *last* outer iteration
+  slide backwards so its inner block ends exactly at the boundary —
+  `base = min(xo*8 + min, max+1−8)`. Every iteration does a full 8 elements;
+  some elements near the edge are computed twice. Illegal for updates
+  (recomputing an update is not idempotent), which is why updates default to
+  RoundUp/GuardWithIf.
+- Variants (`Predicate`, `PredicateLoads/Stores`, blend forms) push the guard
+  into load/store predicates instead of a branch — needed for vectorized
+  updates.
+- Splits of reduction variables are marked *exact*: an RVar loop may never
+  visit points outside its domain (the domain is semantically meaningful), so
+  their tails must guard, never round up.
 
-`InjectFunctionRealization::visit(const For*)` (ScheduleFunctions.cpp:1180–1870):
+**Wrap the loops.** Walking the `dims` list from innermost to outermost, wrap a
+`For` node per dim, with the symbolic bounds described in §5.2, the ForType
+from the schedule, and interleaved `let`s from the splits.
 
-1. Digs through prefetch placeholders and *pure* lets/ifs at the top of the loop body
-   (never past a side-effecting let), recurses into the body first (innermost match
-   wins).
-2. If `compute_level.match(for_loop->name)` (LoopLevel matching is against qualified
-   loop names like `g.s0.x`): body → `build_pipeline_group(body)`:
-   - Topologically sorts the group's *stages* (compute_with constraints), builds each
-     stage's loop nest via `build_provide_loop_nest`, and injects it: `Block(producer
-     so far, new nest)` for unfused stages, or — for compute_with — grafts the child
-     nest as a Block *inside* the parent's For loop matching the fuse LoopLevel
-     (`InjectStmt`), then rewrites bounds: each child fused loop becomes an
-     extent-1 loop whose min is the parent's loop var, and the parent loop's bounds
-     become the **union** over all fused children
-     (`replace_parent_bound_with_union_bound`).
-   - Wraps each member in `ProducerConsumer::make_produce`, and the original body in
-     `ProducerConsumer::make_consume` (skipped for outputs); result =
-     `Block(produce..., consume)`.
-3. On the way back out, a `store_level` match wraps the body in
-   **`Realize(f, types, [f.<arg>.min_realized / f.<arg>.extent_realized ...])`**
-   (skipped for outputs — they live in caller buffers). This is how
-   `store_at` outside `compute_at` works: ProducerConsumer at the compute loop,
-   Realize further out. A distinct `hoist_storage_level` match inserts a
-   `HoistedStorage` marker.
-4. Special cases: inlined extern Funcs inside vectorized loops get realized around the
-   vector loop; multi-stage Funcs scheduled "inline" are realized immediately around
-   each consuming Provide (`inline_to_provide`) — inline is lowered as "compute at
-   innermost".
+**Add the guards.** The RDom's `where` predicate becomes an `if` in the body;
+specializations become an if/else-if chain of complete alternative loop nests
+(one per specialization, sharing nothing but the Provide's meaning); under
+`compute_with`, extra guards keep each fused sibling inside its own bounds.
+The pass then does a careful bit of rearranging: it pushes pure `let`s and
+guards as far *out* of the nest as dependences allow. This is not a general
+optimization — it exists specifically so that bounds inference will see the
+guards at outer positions and compute tight bounds. (A telling detail: one
+pass placing statements *so that another pass's analysis works* is exactly the
+kind of hidden coupling a redesign should make structural.)
 
-### 5.5 Naming conventions (the de-facto ABI of mid-level IR)
+### 5.4 Placing each function in its consumer: injection
 
-- Loop vars: `<func>.s<stage>.<var>` (`g.s0.x`, `blur.s1.r$x`), split children
-  `g.s0.x.xi`, fused loops `g.s0.fused.x`, sentinel `g.s0.__outermost`.
-- Loop bounds: `<loopvar>.loop_min/.loop_max` lets defined in terms of stage-bounds
-  symbols `<func>.s<stage>.<var>.min/.max` — free variables until bounds inference.
-  Splits add `.base` and `.guarded`; explicit bounds keep `.min_unbounded/.max_unbounded`.
-- Realization extents: `<func>.<arg>.min_realized/.extent_realized` (per-Func, no
-  stage) — free until `allocation_bounds_inference`.
-- Buffer parameters: `<name>.min.<d>`, `.extent.<d>`, `.stride.<d>`, `<name>.buffer`.
+With per-stage nests buildable, the driver assembles the whole program
+(ScheduleFunctions.cpp:2565–2630). It starts from a synthetic outermost
+loop that runs exactly once, named so that `LoopLevel::root()` matches it —
+making compute_root just a special case of compute_at. Then it processes
+functions in **reverse** realization order — consumers first — so that when a
+producer is placed, its consumer's loops already exist:
 
-### 5.6 Inlining (Inline.cpp)
+For each function (or compute_with group):
 
-For a pure Func scheduled inline, `inline_function` replaces every `Call` to `f` with
-`f`'s value Expr, binding each call argument to `f.<arg>` via `substitute` (trivial
-args) or a `Let` (compound args, preserving work sharing), with per-Provide CSE to
-bound expression growth. `validate_schedule_inlined_function` errors on
-parallel/vectorized dims, store levels, etc. After inlining the Func simply vanishes —
-no Realize, no loops — which is why bounds inference must *itself* re-inline such
-Funcs into consumer expressions (it re-runs an internal `Inliner`).
+1. **Validate the placement.** Walk the statement built so far, find every use
+   of this function, record the stack of enclosing loops at each use, and
+   intersect those stacks. The requested compute/store levels must appear in
+   that common stack, in the right order, with no parallel loop between store
+   and compute (that would be a race). On failure, the error message lists the
+   legal placements — this is where "Func f is computed at an invalid location"
+   errors come from.
+2. **Inline, if scheduled inlined** (and pure): substitute f's expression into
+   every `Call` to f, binding argument expressions with `let`s to avoid
+   duplicating work (Inline.cpp). The function then simply doesn't exist in
+   the imperative program. Note the asymmetry that Section 10 cares about:
+   inlining happens *instead of* building loops, decided before any loops for
+   f exist, on the functional representation.
+3. **Otherwise, inject.** Walk the statement; at the loop matching f's
+   *compute* level, replace the loop body with:
 
-### 5.7 Bounds inference (BoundsInference.cpp, Bounds.cpp)
+   ```
+   produce f { <f's loop nests, one per stage, in order> }
+   consume f { <the original body, which reads f> }
+   ```
 
-Substrate (Bounds.cpp): `bounds_of_expr_in_scope` — symbolic interval arithmetic over
-Exprs given `Interval` bounds for free variables (possibly ±∞), with Halide Calls
-bounded by precomputed `FuncValueBounds`. `Box` = vector of Intervals + `used`
-condition; `boxes_required` / `boxes_provided` / `boxes_touched` compute, per Func
-name, the region covered by all Calls / Provides / both within a Stmt — respecting For
-scopes and using `likely`-tagged `if` conditions to trim domains (which is why
-build_loop_nest hoisted them).
+   and at the (equal or outer) loop matching f's *store* level, wrap the body
+   in `Realize f(<symbolic bounds>)`. When store and compute levels differ,
+   the Realize lands further out than the produce — that separation is what
+   enables the sliding-window reuse pattern (§6.5). Outputs get no Realize
+   (they live in caller-provided buffers). `compute_with` grafting — placing a
+   sibling's loops *inside* another sibling's loop and rewriting the shared
+   loop's bounds to the union of the two — happens here too, and is easily
+   the most intricate code in the file.
 
-The pass (`bounds_inference`, BoundsInference.cpp:1312):
+### 5.5 What the program looks like now
 
-- **Static phase**: build a `Stage` record per (Function, stage) in realization order.
-  Inlined Funcs get no stages and are substituted into consumers' expressions. For
-  each consumer stage, `boxes_required` of its exprs (in a scope mapping its own vars
-  to `[f.sN.x.min, f.sN.x.max]` symbols) is recorded on each producer as
-  `producer.bounds[{consumer, stage}]`. Output stages seed the system with boxes from
-  their output-buffer parameters (`g.min.0`, `g.extent.0`).
-- **Mutation phase** (`visit(const For*)`): the pass walks the loop nest; on the way
-  out of each loop body it inserts LetStmts defining the `.min`/`.max` symbols needed
-  inside:
-  - For each stage produced inside this loop, merge the Boxes from every *relevant*
-    consumer (the currently-producing stage, anything produced inside, fused
-    siblings) via dimension-wise interval union — **this is where multiple consumers
-    merge**.
-  - Apply explicit `bound()`/`align_bounds()` (with `.min_unbounded` kept for the
-    later too-small check).
-  - Emit `let f.s0.x.max = ...; let f.s0.x.min = ...`, plus RVar bounds
-    `let f.s1.r.min = rv.min; let f.s1.r.max = rv.min + rv.extent - 1` (how RDom
-    bounds enter the IR). Extern stages instead run the bounds-query protocol.
-  - If this loop belongs to a producing stage, also re-bind the *production* bounds
-    from `boxes_provided` one level in — deliberately **shadowing** the same names:
-    at each depth, `g.s0.x.min/.max` mean "the region of g handled by the current
-    iterations of all enclosing loops". This shadowing is why no whole-Stmt
-    simplification is legal until `uniquify_variable_names` runs (Lower.cpp:207–209).
-
-### 5.8 Worked micro-example
-
-`f(x) = 2*x; g(x) = f(x) + f(x+1); f.compute_at(g, x);` — after schedule_functions
-and bounds inference (simplified):
+After `schedule_functions`, for the pipeline `f(x) = 2*x; g(x) = f(x) +
+f(x+1);` with `f.compute_at(g, x)`, the program is (tidied):
 
 ```
-let g.s0.x.min = g.min.0                      // from output buffer params
-let g.s0.x.max = g.min.0 + g.extent.0 - 1
 produce g {
-  for (g.s0.x, g.s0.x.loop_min, g.s0.x.loop_max) {
-    let g.s0.x.min = g.s0.x                   // production bounds: SHADOW outer defs
-    let g.s0.x.max = g.s0.x.min               // single point: this iteration
-    let f.s0.x.max = g.s0.x.max + 1           // region of f required inside this loop
-    let f.s0.x.min = g.s0.x.min
-    realize f([f.x.min_realized, f.x.extent_realized]) {
+  let g.s0.x.loop_min = g.s0.x.min          // g.s0.x.min: DANGLING — awaits
+  let g.s0.x.loop_max = g.s0.x.max          //   bounds inference
+  for (g.s0.x from g.s0.x.loop_min to g.s0.x.loop_max) {
+    realize f([f.x.min_realized, f.x.extent_realized]) {    // sizes: dangling
       produce f {
-        for (f.s0.x, f.s0.x.loop_min, f.s0.x.loop_max) {   // 2 iterations
-          f(f.s0.x) = 2*f.s0.x                             // Provide
+        let f.s0.x.loop_min = f.s0.x.min    // dangling
+        let f.s0.x.loop_max = f.s0.x.max
+        for (f.s0.x from f.s0.x.loop_min to f.s0.x.loop_max) {
+          f(f.s0.x) = 2 * f.s0.x                       // Provide
         }
       }
       consume f {
-        g(g.s0.x) = f(g.s0.x) + f(1 + g.s0.x)              // Provide + Calls
+        g(g.s0.x) = f(g.s0.x) + f(1 + g.s0.x)          // Provide + 2 Calls
       }
     }
   }
 }
 ```
 
-The classic compute_at redundant-compute/locality trade is directly visible.
-`min_realized`/`extent_realized` are resolved later by allocation bounds inference
-(`boxes_touched` inside the Realize).
-
-### 5.9 Immediately downstream: sliding window, storage folding
-
-- **`sliding_window`** (SlidingWindow.cpp): for `store_at` outside `compute_at`,
-  when the required region marches monotonically with the intervening serial loop,
-  rewrite the producer's computed region so each iteration computes only the *new*
-  values (`new_min = prev_max + 1`, warm-up clamped). Recompute shrinks; storage
-  stays full-size.
-- **`storage_folding`** (StorageFolding.cpp): the storage-side complement — if the
-  live window along a dimension fits in `F`, rewrite all accesses modulo `F` and
-  shrink the Realize extent, making a circular buffer (e.g. two scanlines). Emits
-  fold-factor-too-small assertions for dynamic cases; async pipelines get semaphore
-  releases so producers don't overwrite unconsumed entries.
-
-Both passes work by *rewriting the bounds of already-placed fragments* — worth
-noticing for §8.
+Loops exist, producer-consumer structure exists, but every size is a symbol.
 
 ---
 
-## 6. The rest of lowering: pass pipeline to codegen
+## 6. Phase 1b: computing sizes (bounds inference)
 
-`lower_impl` (Lower.cpp:137–606) threads one Stmt through the passes below (exact
-order; grouped by phase). The load-bearing ones get detail after the list.
+### 6.1 Interval arithmetic from first principles
 
-**Phase A — instrumentation and early semantic injection** (Provide/Call/Realize IR):
-1. `inject_memoization` — cache lookup/store around memoized realizations.
-2. `inject_tracing` — `halide_trace` calls at loads/stores/realizations.
-3. `add_parameter_checks` — asserts on scalar params + "constrained" substitutes.
-4. `clamp_unsafe_accesses` — clamp Func-indexes-Func patterns where allocation
-   bounds may exceed compute bounds.
+The question bounds inference answers, over and over: *given that x ranges over
+[a, b], what range can expression e(x) take?* The technique is interval
+arithmetic — evaluate the expression over intervals instead of numbers:
 
-**Phase B — making bounds concrete:**
-5. `bounds_inference` (§5.7).
-6. `add_split_factor_checks` — parameter split factors must be > 0.
-7. `remove_extern_loops` — delete extern stages' placeholder loops.
-8. `sliding_window` (§5.9).
-9. `uniquify_variable_names` — after this, syntactic name equality is semantic.
-10. `simplify` (first full run; rerun after most structural passes below).
-11. `simplify_correlated_differences` — cancel correlated let differences that naive
-    interval arithmetic would blow up (issue #3697).
-12. `allocation_bounds_inference` — per Realize, `boxes_touched` over its body defines
-    `f.<arg>.min_realized/.max_realized/.extent_realized` lets outside the Realize;
-    `bound()` overrides with too-small assertions; unbounded access is a user error.
-13. `add_image_checks` — required-region lets per input/output buffer, buffer
-    type/dims/OOB/alignment asserts, constrained-variable substitution (so declared
-    strides fold into address math), and the bounds-query path (null host → fill
-    buffer shapes instead of running).
-14. `remove_undef` — delete Provides whose value is `undef`.
-15. `storage_folding` (§5.9).
-16. `debug_to_file`.
-17. `inject_prefetch` — fill placeholder Prefetch regions.
-18. `lower_safe_promises` — strip `promise_clamped` (its job — tightening
-    boxes_touched — is done).
+- [1,3] + [10,20] = [11,23]
+- [1,3] · [−2,2] = [−6,6] (take min/max over the corner combinations)
+- min([a,b],[c,d]) = [min(a,c), min(b,d)], and so on per operation.
 
-**Phase C — eliminating mid-level nodes:**
-19. `skip_stages` — guard productions that are conditionally never read.
-20. `fork_async_producers` — `async()` producers become `Fork` branches synchronized
-    with `Acquire`/semaphore-release pairs; ring buffers add slots.
-21. `split_tuples` — tuple Realize/Provide/Call → per-component `f.0`, `f.1`, ...
-22. `canonicalize_gpu_vars` — canonical `.__block_id_x`/`.__thread_id_x` names.
-23. `bound_small_allocations` (+ another `simplify_correlated_differences`) —
-    constant-bound small allocations (enables stack promotion; required in GPU
-    kernels).
-24. **`storage_flattening`** — the phase transition (detail below).
-25. `add_atomic_mutex` — mutex buffers for non-hardware-atomizable Atomic nodes.
-26. `unpack_buffers` — every buffer symbol's `host`/`min.i`/`extent.i`/`stride.i` and
-    dirty bits become lets over `_halide_buffer_get_*` calls on the single
-    `name.buffer` handle. After this, the only free symbols are scalar params and
-    `.buffer` handles — exactly a LoweredFunc's argument list.
-27. `rewrite_memoized_allocations`.
+Two things make Halide's version more than a textbook exercise
+(Bounds.cpp:1826, `bounds_of_expr_in_scope`):
 
-**Phase D — device data movement** (if GPU-ish target): 28. `select_gpu_api`;
-29. `inject_host_dev_buffer_copies` (dirty-bit tracking, `halide_copy_to_device/host`,
-`halide_device_malloc`); 30. `select_gpu_api` again.
+- The interval endpoints are themselves **symbolic expressions**, not numbers
+  — "x ranges over [g.min.0, g.min.0 + g.extent.0 − 1]" — and every endpoint
+  computation goes through the simplifier. Bounds can also be infinite (a
+  missing endpoint), and analysis must stay *conservative*: when in doubt,
+  widen. This is also exactly why Halide's unusual arithmetic semantics exist:
+  Euclidean division and no-overflow 32-bit ints make symbolic interval
+  endpoints vastly simpler.
+- Naive interval arithmetic is blind to correlation: if y = x+3, it bounds
+  y − x as [span of y] − [span of x] instead of the exact 3. A dedicated
+  helper pass (`simplify_correlated_differences`) exists just to cancel such
+  terms before they poison loop bounds and allocation sizes.
 
-**Phase E — loop-level restructuring:**
-31. `simplify` + `unify_duplicate_lets`.
-32. `reduce_prefetch_dimension`.
-33. `simplify_correlated_differences`.
-34. `bound_constant_extent_loops` — vectorized/unrolled loops must get constant
-    extents (pad + guard if only a constant bound exists).
-35. `unroll_loops` — literal body duplication (Block of substituted copies).
-36. `vectorize_loops` + `simplify` (detail below).
-37. `fuse_gpu_thread_loops` — normalize thread loops per block, insert barriers, merge
-    shared allocations.
-38. `rewrite_interleavings` — `select(x%2==0, a, b)` store patterns → shuffles + dense
-    stores.
-39. `partition_loops` + `simplify` (detail below).
-40. `stage_strided_loads` — strided vector loads → wider dense loads + shuffles when
-    provably safe.
+On top of expression bounds sits the **box** machinery: a box is a vector of
+intervals, one per dimension — a symbolic rectangle. `boxes_required(stmt)`
+computes, for each function, the box covering every coordinate at which the
+statement *reads* it (walking all the `Call(Halide)` nodes, with loop variables
+bound to their ranges); `boxes_provided` does the same for writes;
+`boxes_touched` unions both. Boxes from multiple uses are merged by
+dimension-wise interval union.
 
-**Phase F — final cleanup and canonicalization:**
-41. `trim_no_ops`; 42. `rebase_loops_to_zero`; 43. `hoist_loop_invariant_if_statements`;
-44. `inject_early_frees`; 45. `fuzz_float_stores` (testing feature);
-46. `simplify_correlated_differences`; 47. `bound_small_allocations` again;
-48. `inject_profiling`; 49. `lower_warp_shuffles` (CUDA);
-50. `common_subexpression_elimination` (once, late — earlier passes prefer expanded
-    exprs); 51. `lower_unsafe_promises` (assert in Debug, strip in release);
-52. `extract_tile_operations` (AMX; the representative target-legalization slot);
-53. `flatten_nested_ramps`; 54. `remove_dead_allocations` + `simplify` + LICM
-    (`hoist_loop_invariant_values` — matters for GPU kernels where LLVM won't);
-55. `find_intrinsics` — pattern-match `widening_add`/`rounding_shift_right`/... —
-    deliberately *after* the last simplify, which would undo these forms;
-56. `hoist_prefetches`; 57. `strip_asserts` (NoAsserts); 58. user's custom lowering
-    passes. The Stmt is snapshotted as the module's "conceptual stmt" (what
-    `.stmt`/`.stmt_html` show).
+### 6.2 The pass
 
-**Phase G — offload splitting and outlining (Stmt → multiple LoweredFuncs):**
-59. `inject_hexagon_rpc`; 60. `inject_gpu_offload` — GPU loop nests are compiled *now*
-    (inside lowering) by a `CodeGen_GPU_Dev` into device modules (PTX/SPIR-V/...)
-    embedded as buffers; host side becomes `halide_<api>_run(...)` calls;
-61. `infer_arguments` — scan for referenced Parameters/Buffers to build the argument
-    list; 62. `lower_parallel_tasks` — **where `ForType::Parallel` dies** (detail
-    below).
+`bounds_inference` (BoundsInference.cpp) fulfills the contract from §5.2. In
+outline:
 
-Finally: output-buffer Parameters become arguments, referenced-but-unlisted Buffers
-are embedded, weak Function refs strengthened, and the Stmt becomes
-`LoweredFunc(name, args, body, linkage)` in the `Module`.
+**Static phase.** For each stage of each function, compute — once — the box of
+each of its producers that its expressions require, in terms of the *consumer's
+own* symbolic bounds. ("g.s0 requires f over [g.s0.x.min, g.s0.x.max + 1]".)
+Functions scheduled inline have no loops, so the pass substitutes their
+expressions into consumers before analyzing (yes: inlining logic exists twice —
+once in phase 1a for the program, once here for the analysis).
 
-### 6.1 storage_flattening (StorageFlattening.cpp)
+**Seeding.** Output functions get their bounds from the output buffer's
+runtime shape: `g.s0.x` ranges over `[g.min.0, g.min.0 + g.extent.0 − 1]`,
+where `g.min.0`/`g.extent.0` are fields of the buffer argument the caller
+passes in.
 
-Four sub-passes: `zero_gpu_loop_mins`, `FlattenDimensions`, `HoistStorage`,
-`PromoteToMemoryType`.
+**Mutation phase.** Walk the loop nest from the outside in; just inside each
+loop, insert `let` statements defining the `.min`/`.max` symbols that stages
+computed inside that loop need. The subtle and beautiful part is that the same
+names get **redefined at each loop depth**, shadowing the outer definition: at
+any point in the program, `f.s0.x.min ... f.s0.x.max` means "the region of f
+needed *by the current iterations of all enclosing loops*". Producers nested
+deeper automatically consume the narrower, iteration-specific definitions.
+(Consequence: while these deliberate shadowings exist, whole-program
+simplification is unsound — variable names don't uniquely identify values —
+so lowering runs `uniquify_variable_names` before the first global simplify;
+Lower.cpp:207–209.)
 
-- **Realize → Allocate**: match the Function's `storage_dims` against its args to get
-  the storage permutation; apply `bound_storage` (with assert) and `align_storage`
-  (round allocation extents up); mint `f.min.i / f.extent.i / f.stride.i` symbols in
-  storage order; build a `_halide_buffer_init` struct bound as `let f.buffer` (so
-  internal allocations can be passed to extern stages/device copies); emit
-  `Allocate(f, type, extents, body)`; define strides in storage order
-  (`stride[inner]=1`, `stride[j] = stride[prev]*allocation_extent[prev]`) — **this is
-  where reorder_storage/align_storage actually change layout** — then min/extent lets.
-- **Flat index** (`flatten_args`): internal allocations use
-  `(x - f.min.0)*f.stride.0 + (y - f.min.1)*f.stride.1` (terms cancel after
-  simplification); external buffers use `x*stride0 + y*stride1 - (min0*stride0 +
-  min1*stride1)` (the base term is loop-invariant and hoists). Constant coordinate
-  offsets are peeled so stencil taps share a base address. `LargeBuffers` → int64
-  index math.
-- **Provide → Store**, attaching the output-buffer Parameter when writing an output;
-  **Call(Halide|Image) → Load**, attaching Buffer/Parameter. (GPU texture memory
-  becomes `image_load`/`image_store` intrinsics instead.)
-- Input/output buffers get no Allocate and no local shape lets — their
-  `min/stride/extent` symbols stay free until `unpack_buffers` defines them from the
-  `halide_buffer_t`.
-- **HoistStorage** deletes Allocates at their original site, bounds their extents over
-  intervening loop ranges, and re-creates one Allocate at the `HoistedStorage` marker.
+For the §5.5 example, the result is (tidied):
 
-### 6.2 Vectorize / unroll / partition
+```
+let g.s0.x.min = g.min.0                    // from the output buffer
+let g.s0.x.max = g.min.0 + g.extent.0 - 1
+produce g {
+  for (g.s0.x from g.s0.x.min to g.s0.x.max) {
+    let g.s0.x.min = g.s0.x                 // SHADOW: this iteration's point
+    let g.s0.x.max = g.s0.x
+    let f.s0.x.min = g.s0.x.min             // f needed over [x, x+1]
+    let f.s0.x.max = g.s0.x.max + 1
+    realize f([...]) {
+      produce f {
+        for (f.s0.x from f.s0.x.min to f.s0.x.max) {   // 2 iterations
+          f(f.s0.x) = 2 * f.s0.x
+        }
+      }
+      consume f {
+        g(g.s0.x) = f(g.s0.x) + f(1 + g.s0.x)
+      }
+    }
+  }
+}
+```
 
-- **`unroll_loops`**: for `ForType::Unrolled` (constant extent guaranteed by pass 34),
-  emit `extent` substituted copies of the body as a Block; re-uniquify names after.
-- **`vectorize_loops`** (`VectorSubs`): the vectorized loop var becomes
-  `Ramp(min, 1, lanes)` (nested vectorization → broadcasts of ramps / ramps of
-  broadcasts to the combined lane count). Mutation is type-driven widening: binary
-  ops broadcast the narrower side; Lets get `.widened` versions; Load/Store widen
-  index+value+predicate (dense index = Ramp → dense load; anything else =
-  gather/scatter for codegen). Vector conditions: first try pushing the condition
-  into Load/Store `predicate` fields (`PredicateLoadStore`); if the condition carries
-  `likely` (partitioning material), emit `if (all_true_of_lanes) vectorized else
-  (predicated | scalarized)`; last resort `scalarize` (re-wrap the body in a serial
-  loop over lanes). Allocations inside vector loops get extents × lanes.
-- **`partition_loops`**: find `likely`-tagged conditions in the body, solve each for
-  the loop var, intersect → the steady-state interval where all likely branches hold;
-  emit prologue [min, steady) with the original body, steady state with tagged exprs
-  replaced by their likely values (no clamps/selects → dense vector code), epilogue
-  (steady, max]. Best-effort and semantics-preserving; per-loop `Partition` policy
-  controls it. This is how `ShiftInwards` splits and `BoundaryConditions::*` become
-  zero-overhead in the steady state.
+Each iteration of g computes the two values of f it needs — the classic
+compute_at trade of redundant work for locality, now visible as arithmetic.
 
-### 6.3 Parallelism and async
+Reduction loops get their bounds here too (straight from the RDom's min/extent
+— that's how RDom bounds enter the imperative program), and extern stages run
+their bounds-query protocol.
 
-`ForType::Parallel` is a plain attribute all the way through lowering; it is
-eliminated by **`lower_parallel_tasks`** (LowerParallelTasks.cpp, pass 62 — a lowering
-pass now, no longer codegen): compute a `Closure` (every referenced var/buffer),
-pack it into a struct, outline the body into a new internal `LoweredFunc` with a
-`halide_task_t`/`halide_loop_task_t` signature, and replace the loop with
-`halide_do_par_for(fn, min, extent, closure)` (or `halide_do_parallel_tasks` with a
-semaphore-acquire array for Fork/Acquire task graphs from `async()`).
-`CodeGen_LLVM::visit(For)` asserts it never sees a Parallel loop.
+### 6.3 Allocation sizes
 
-### 6.4 End state before codegen
+A separate, simpler pass (`allocation_bounds_inference`,
+AllocationBoundsInference.cpp) fills the other half of the contract: for each
+`Realize`, compute `boxes_touched` of its body and define the
+`min_realized`/`extent_realized` symbols just outside it. User `bound()`
+declarations override the inferred values, with a runtime assertion that the
+declared region really covers the touched one.
 
-Final Stmt node inventory: serial `For` (rebased to 0), `LetStmt` everywhere
-(buffer field extraction, bounds, CSE), `IfThenElse` (asserts' guards, skip-stages,
-partition remnants, bounds-query branch), `AssertStmt` → `halide_error_*`,
-flat possibly-vector `Load`/`Store` (Ramp/Broadcast indices, predicates,
-ModulusRemainder alignment), `Allocate`/`Free` for internals, `ProducerConsumer` as
-inert markers, `Call` to extern runtime functions and pure intrinsics, `Atomic` only
-where real. `Realize`/`Provide`/`Call(Halide)`/`Prefetch`-node/`Fork`/`Acquire` are
-gone — their presence after lowering is a compiler bug.
+### 6.4 Checks on the pipeline's edges
 
-A **`Module`** (Module.h:144) = target + `LoweredFunc`s + embedded Buffers (weights,
-device blobs) + submodules + the conceptual Stmt. A **`LoweredFunc`** = {name,
-`LoweredArgument`s (Argument + alignment), body Stmt, linkage, mangling}. Buffer
-arguments arrive as `halide_buffer_t*` bound to `name.buffer`; the body unpacks
-via `_halide_buffer_get_*` lets and validates via the image-check asserts.
-`CodeGen_LLVM::compile_func` then just walks the Stmt — everything semantically
-interesting was decided in lowering.
+Two related passes make the pipeline safe at its boundary. One asserts scalar
+parameters satisfy their declared constraints. The other
+(`add_image_checks`) compares each input/output buffer's *required* box
+against the actual buffer the caller passed, emitting the out-of-bounds
+errors Halide users know; it also substitutes any *declared* buffer
+constraints (e.g. "stride 1 in x") into the program as facts the simplifier
+can exploit, and implements bounds-query mode: calling the pipeline with
+null data pointers fills the buffers' shape fields with what the pipeline
+would need, instead of running.
+
+### 6.5 Two follow-on optimizations that rewrite bounds
+
+Immediately after bounds inference come two passes that exploit the now-explicit
+region arithmetic. Both matter enormously for stencil pipelines (where each
+output reads a small window of a producer):
+
+- **Sliding window** (SlidingWindow.cpp): if f is *stored* outside a serial
+  loop but *computed* inside it, consecutive iterations need overlapping
+  regions of f. Since the storage persists across iterations, each iteration
+  can skip the overlap and compute only the new part: the pass rewrites f's
+  per-iteration bounds to `max(needed_min, previous_iteration_max + 1)`.
+  Redundant recompute drops from window-size× to ~1×.
+- **Storage folding** (StorageFolding.cpp): after sliding, only a small
+  rolling window of f is ever *live* at once. If that window provably fits in
+  k rows, all accesses along that dimension can be rewritten modulo k and the
+  allocation shrunk to k rows — a circular buffer. Together the two passes
+  turn "compute everything" schedules into classic line-buffered pipelines.
+
+Note for Section 10: both passes work by *rewriting the region bounds of
+already-placed loop nests* — precisely the quantities a reified mid-level IR
+would expose as explicit parameters.
 
 ---
 
-## 7. Blueprint: "Halide lite"
+## 7. Phase 2: from coordinates to memory, and on to the back end
 
-A standalone recreation that stays close in design and capability, targeted at
-research. What follows is a distillation of the minimum machinery that reproduces the
-essential Halide behavior, with the cruft named explicitly.
+After bounds inference the program still speaks in multi-dimensional
+coordinates. The rest of lowering (~50 more passes in Lower.cpp:178–606, each a
+`Stmt → Stmt` function, logged and re-simplified along the way) grinds this
+down to flat memory and machine-shaped loops. The pass list groups into phases;
+the load-bearing ones are explained below, the rest summarized.
 
-### 7.1 Core data structures (~1–2 kLoC)
+### 7.1 The phase transition: storage flattening
 
-1. **Type**: {Int/UInt/Float/Handle, bits, lanes}.
-2. **Expr nodes** (immutable, refcounted, type-tagged; `as<T>` by tag): immediates,
-   Variable, Cast, Add/Sub/Mul/Div/Mod (Euclidean!), Min/Max, comparisons, And/Or/Not,
-   Select, Let, Call, Ramp, Broadcast, Load. Keep Halide's Call design: one node with
-   a CallType enum covering {Halide, Image, Extern, Intrinsic} — it is what lets the
-   same Expr type span all levels.
-3. **Stmt nodes**: LetStmt, AssertStmt, For (pick min/extent *or* min/max and be
-   consistent; Halide recently moved to inclusive min/max), Block, IfThenElse, Store,
-   Provide, Allocate, Free, Realize, ProducerConsumer, Evaluate.
-4. **Visitor + Mutator** with rebuild-only-on-change. Generate from an X-macro or
-   equivalent; this is boilerplate you want exactly once.
-5. **Function** = {name, args, init Definition, update Definitions, FuncSchedule};
-   **Definition** = {args, values, predicate, StageSchedule}. Enforce the two purity
-   rules (§2.3): pure-def RHS vars ⊆ {args, params}; update pure LHS positions match
-   by name, exactly one RDom.
-6. **Schedule**: `Split {old, outer, inner, factor, tail, kind}` ordered log; `Dim
-   {var, for_type, dim_type}` list, innermost-first, with the `__outermost` sentinel
-   (it genuinely simplifies compute_at-at-outermost and is cheap); `LoopLevel {func,
-   stage, var} | root | inlined`; FuncSchedule {compute_level, store_level,
-   storage_dims, bounds}. Directives are metadata edits exactly as in §4.4 — `tile` =
-   2 splits + reorder, `vectorize(x, n)` = split + mark.
+`storage_flattening` (StorageFlattening.cpp) eliminates the mid-level nodes.
+First, the idea from first principles: a multi-dimensional array in flat memory
+is a *convention* — element (x, y) of a W×H array lives at address
+`x·stride_x + y·stride_y` for chosen strides (row-major: stride_x = 1,
+stride_y = W). Choosing strides *is* choosing the memory layout.
 
-Two Halide design decisions worth *changing* in a clean recreation:
+The pass does exactly this:
 
-- **Strings as the composition mechanism.** Halide's suffix-matching of dim names
-  (`x` matches `x.xi`... no, query `xi` matches dim `x.xi`) and the
-  `f.s0.x.loop_min` naming ABI work, but they are the single largest source of
-  fragility. Use interned structured symbols ({func, stage, var, role}) with a
-  printable form.
-- **Bounds symbols as dangling free variables + shadowing redefinition.** Works, but
-  forces the "no simplification until uniquify" rule and makes the IR unreadable
-  mid-flight. §8's fragment parameters are the cleaner alternative; even without the
-  full proposal, making the bounds contract a first-class map (stage → required Box
-  expression) rather than name conventions costs little.
+- **`Realize f` → `Allocate f`** with a one-dimensional size, plus `let`s
+  defining `f.min.d`, `f.extent.d`, and `f.stride.d` per dimension. The stride
+  chain follows the schedule's `storage_dims` order (innermost stored
+  dimension gets stride 1) — this is the moment `reorder_storage` and
+  `align_storage` actually change anything.
+- **`Provide f(x, y) = v` → `Store`** at index
+  `(x − f.min.0)·f.stride.0 + (y − f.min.1)·f.stride.1`.
+- **`Call f(x, y)` (Halide/Image kind) → `Load`** at the same index form. For
+  external buffers the algebra is rearranged so the runtime-dependent base
+  offset is a single loop-invariant term that hoists out of loops.
+- Tuple-valued functions were already split (by an earlier pass,
+  `split_tuples`) into one buffer per element, named `f.0`, `f.1`, ....
 
-### 7.2 Lowering skeleton (~10 passes)
+Input and output buffers get no Allocate — their min/stride/extent symbols
+are later defined from the `halide_buffer_t` argument fields by
+`unpack_buffers`, which is also what finally pins down the pipeline's
+argument list: after it, the only free names in the program are scalar
+parameters and `<name>.buffer` handles.
 
-1. **Environment + realization order**: walk Call(Halide) edges; topological sort.
-   (Skip wrappers, fused groups.)
-2. **Inline pure funcs scheduled inline** (substitute value into Call sites, Let-bind
-   compound args).
-3. **schedule_functions**: reverse realization order; per stage,
-   `build_provide_loop_nest` = Provide seed → apply splits (RoundUp + GuardWithIf tail
-   strategies only, with the promise_clamped/`likely` trick if you implement
-   partitioning; otherwise plain `if`) → wrap Fors from dims (bounds = symbolic) →
-   emit split-bound lets and `.loop_min = .min` lets. Injection: walk the consumer
-   Stmt; at compute-level match wrap body in Block(produce nest, consume body); at
-   store-level match wrap in Realize with symbolic extents.
-4. **bounds_inference**: interval arithmetic (`bounds_of_expr_in_scope`) +
-   `boxes_required/provided`; walk the nest, emit `.min/.max` lets per loop depth
-   with the shadowing semantics (or fragment parameters). Union over consumers.
-5. **allocation bounds**: `boxes_touched` per Realize → concrete Realize extents.
-6. **uniquify + simplify.** Budget real effort for the simplifier: Halide's is
-   enormous (Simplify_*.cpp) because *every* pass leans on it; a lite version needs
-   at least constant folding, let substitution/dead-let elimination, algebraic
-   min/max/div/mod rules, and bounds-aware branch pruning. This is the second-largest
-   component after the frontend and the one that most determines output quality.
-7. **storage_flattening**: Realize→Allocate + stride lets, Provide→Store,
-   Call(Halide/Image)→Load with the two indexing strategies of §6.1.
-8. **vectorize/unroll** (optional but high-value): VectorSubs-style widening; unroll
-   by substitution. Skip predication/scalarization initially — require clean divides
-   via RoundUp/GuardWithIf.
-9. **Output checks**: minimal image checks (dims/type asserts, required-region ≤
-   buffer bounds) or simply trust inputs in a research setting.
-10. **Codegen**: easiest credible target is C source (Halide's own CodeGen_C is a
-    direct Stmt walk); LLVM is a direct translation too since the Stmt is that low
-    level.
+### 7.2 Making loops machine-shaped: unroll and vectorize
 
-### 7.3 What to cut (and what each cut costs)
+- **Unrolling** is textual: a loop marked unrolled (its extent by now a
+  constant) becomes N pasted copies of the body with the loop variable
+  substituted.
+- **Vectorization** (VectorizeLoops.cpp) is a *type-driven rewrite*, not a
+  dependence analysis: the loop variable of a vectorized loop (constant extent
+  k) is replaced by the vector `Ramp(min, 1, k)`, and the substitution is
+  pushed through the body — any operation with a vector operand becomes a
+  vector operation, scalars are broadcast, loads/stores get vector indices (a
+  contiguous index becomes a dense vector load; anything else a
+  gather/scatter). Halide can vectorize *anything* this way because the
+  schedule already guaranteed lockstep semantics. Control flow inside a
+  vectorized body is handled by a fallback ladder: push the condition into
+  load/store predicates if possible; if the condition came from loop
+  partitioning, test "all lanes true" and branch between a fast vector body
+  and a guarded one; failing all else, *scalarize* (re-wrap the body in a
+  serial loop over lanes).
 
-| Cut | Cost |
-|---|---|
-| Specializations | lose per-condition schedule variants (autoschedulers use them; users rarely start there) |
-| compute_with | lose horizontal loop fusion; large simplification of schedule_functions (§5.4's bound-union machinery disappears) |
-| async/Fork/Acquire/ring_buffer | lose pipeline parallelism; ProducerConsumer stays a pure marker |
-| Tuples | little; or keep — parallel-vectors design is cheap |
-| rfactor / associativity prover | lose parallel reductions (big feature, big machinery) |
-| Extern stages + bounds queries | lose FFT/library interop |
-| Sliding window + storage folding | lose the line-buffering pattern; consider keeping — both are compact, high-payoff passes |
-| GPU, Hexagon, memoization, tracing, profiling | orthogonal features |
-| Tail strategies beyond RoundUp/GuardWithIf | lose blend/predicate niches, keep the essential semantics |
-| Loop partitioning + `likely` machinery | boundary conditions cost a branch per pixel until you add it |
+### 7.3 Getting rid of the boundary tax: loop partitioning
 
-Keep, non-negotiably: the two-layer IR with a shared Expr type; schedule-as-data with
-the ordered split log + dims list; the Provide/Realize/Call(Halide) mid-level;
-symbolic-then-inferred bounds; interval arithmetic; storage flattening as a distinct
-phase; the Euclidean div/mod semantics (interval arithmetic depends on it).
+GuardWithIf tails, `ShiftInwards` overlaps, and user boundary conditions all
+put per-iteration `if`s into loop bodies. `partition_loops`
+(PartitionLoops.cpp) removes them from the common case: conditions marked with
+the `likely` intrinsic are solved for the loop variable to find the sub-range
+where they all hold; the loop is emitted as up to three copies — prologue
+(original body), a *steady state* over that sub-range with every likely
+condition replaced by its likely value (no branches, dense vector code), and
+epilogue. This is why Halide boundary conditions are effectively free in the
+interior of an image.
 
-Pitfalls observed in the real codebase worth pre-empting: (a) the "no simplify before
-uniquify" trap; (b) interval arithmetic must handle ±∞ and correlated differences or
-allocation bounds explode; (c) suffix name matching bites the moment two vars share a
-suffix; (d) `For` min/max-vs-extent off-by-ones; (e) RVar splits must not over-iterate
-(exactness), which is why `exact` exists on Split.
+### 7.4 Parallelism becomes function calls
+
+A parallel loop survives as a mere loop attribute until nearly the end. Then
+`lower_parallel_tasks` (LowerParallelTasks.cpp) performs *closure conversion*,
+the standard technique for shipping a code block to another thread: collect
+every variable and buffer the loop body references (the closure), pack them
+into a struct, move the body into a new top-level function taking (loop index,
+closure pointer), and replace the loop with a call to the runtime:
+`halide_do_par_for(task_function, min, extent, &closure)`. The thread pool
+lives in the runtime library, swappable by the user. Asynchronous
+producer-consumer pipelines (`async()`, from `Fork`/`Acquire` nodes) lower
+similarly into task-list calls with semaphores. Consequently the LLVM backend
+flatly refuses to see a parallel For — by codegen, parallelism is just calls.
+
+GPU offload is handled analogously but earlier: loops marked as GPU
+blocks/threads are compiled — during lowering — by a device code generator
+into a device module (PTX, SPIR-V, ...) embedded in the binary, and replaced on
+the host side with runtime launch calls plus automatically inserted
+host↔device copies driven by dirty-bit tracking.
+
+### 7.5 The rest of the pass roster
+
+In rough order, the remaining work (each one file, each a sentence):
+memoization and tracing instrumentation; `skip_stages` (guard producers whose
+consumers are conditionally never run); tightening passes (`trim_no_ops`,
+`rebase_loops_to_zero`, loop-invariant code motion, `remove_dead_allocations`);
+`bound_small_allocations` (prove small allocations constant-size so they go on
+the stack); atomics → hardware atomics or mutexes; a late single
+common-subexpression-elimination pass; `find_intrinsics` (pattern-match
+arithmetic into target-friendly ops like `widening_add` — deliberately *after*
+the last simplifier run, which would undo them); assertion stripping under
+`NoAsserts`; and user-registered custom passes. Then argument inference, and
+the statement is wrapped into a `LoweredFunc` inside a `Module`.
+
+### 7.6 What the back end receives
+
+The final statement contains only: serial `For` loops (parallel/vector/unrolled
+all dissolved), `LetStmt`s everywhere, `IfThenElse`/`AssertStmt`, flat
+(possibly vector) `Load`/`Store`, `Allocate`/`Free` for internal scratch,
+inert `ProducerConsumer` labels, and `Call`s to runtime functions and
+intrinsics. A `Module` (Module.h) is a set of `LoweredFunc`s (name, argument
+list, body, linkage) plus embedded buffers (weights, GPU kernels). Buffer
+arguments arrive as `halide_buffer_t*`; the body unpacks fields itself. Code
+generation (CodeGen_LLVM.cpp, CodeGen_C.cpp) is then a straightforward walk of
+the statement — every semantically interesting decision has already been made.
 
 ---
 
-## 8. Toward a reified mid-level IR: making the big step incremental
+## 8. Interlude: what to take away before the proposals
 
-### 8.1 What is entangled today
+Three observations set up the final two sections:
 
-`schedule_functions` is one pass that does six jobs in a single traversal:
+1. **The system composes through a string-named contract.** Loop nests are
+   built with dangling `.min`/`.max` names; injection grafts them together;
+   one global pass fulfills all the names at once, using deliberate shadowing
+   to encode "the region needed by the current iterations". Semantically, each
+   stage's loop nest is a *function from a requested region to a statement* —
+   but that function exists only implicitly, in a naming convention.
+2. **Per-stage loop building is already independent.** `build_provide_loop_nest`
+   consumes one Definition plus its StageSchedule and nothing else. The
+   entanglement is everything around it: placement walks the global statement,
+   inlining bypasses loop-building entirely, compute_with grafts nests into
+   each other, and bounds inference is global.
+3. **Passes are functions.** There is no pass manager, no shared context; each
+   pass is `Stmt → Stmt` in its own file. The architecture is *already*
+   loosely coupled at the pass level — the coupling lives in the IR contracts
+   between passes.
 
-1. **Per-stage loop synthesis** (`build_provide_loop_nest`) — *already independent per
-   stage*: it consumes only the Definition + StageSchedule and produces a
-   self-contained nest with a symbolic-bounds interface.
-2. **Specialization trees** — per-stage too (recursive nest construction + if-chain).
-3. **compute_with fusion** — statement grafting into a sibling's nest plus bound-union
-   rewriting; entangled with (4) because fused groups inject together.
-4. **Consumer-nest injection** — `InjectFunctionRealization` walks the *partially
-   built global Stmt* to find LoopLevel matches; legality checking
-   (`ComputeLegalSchedules`) also reads the global Stmt.
-5. **Inlining decisions** — routed *before* loop synthesis to `Inline.cpp`, operating
-   on the functional layer; an inlined Func never gets loops. Bounds inference must
-   then separately re-implement inlining internally for its analysis.
-6. **Output/legality validation** against the whole pipeline.
+---
 
-The composition mechanism binding these together is the **string-named symbolic
-bounds contract** (§5.5): each nest leaves `f.sN.v.min/.max` free; injection places
-nests; a *global* bounds-inference pass fulfills every contract level-by-level with
-shadowing lets. Semantically, each stage's loop nest is already a **function from a
-requested region (Box) to a Stmt** — but that function exists only implicitly, in
-the naming convention, and is only ever applied once, by one global pass. There is no
-point in the pipeline where "the set of per-Func loop nests with explicit call edges"
-is a first-class, manipulable value.
+## 9. Blueprint: building "Halide lite"
 
-Two further observations sharpen the case:
+A standalone recreation, close in design and expressive power, sized for
+research. Rough shape: a few thousand lines for the core, dominated by the
+simplifier.
 
-- The container-sorting in `build_loop_nest` (§5.3 step 5) exists *only* so a later
-  global analysis (BoxesTouched) can see `likely` guards at outer scopes. That's a
-  pass communicating with another pass through incidental statement placement — a
-  clear sign the interface wants to be structural.
-- `sliding_window` and `storage_folding` are *bounds rewrites of already-placed
-  fragments* — they edit exactly the quantities (per-iteration produced/required
-  regions) that a reified fragment interface would expose as parameters.
+### 9.1 The pieces to build, in order
 
-### 8.2 The proposal, concretely
+**1. Types and expressions (~500 lines).** Type = {kind, bits, lanes}.
+Immutable, refcounted nodes with a type tag; `Expr`/`Stmt` handles; the ~25
+expression kinds you actually need (constants, arithmetic with *Euclidean*
+div/mod, comparisons, logic, Select, Cast, Variable, Call-with-kind-enum, Let,
+Ramp, Broadcast, Load) and ~12 statement kinds (LetStmt, For, Block,
+IfThenElse, Provide, Realize, ProducerConsumer, Store, Allocate, Free,
+AssertStmt, Evaluate). Keep Halide's single-Call-node design — it is what lets
+one expression language span all levels. Write the visitor and
+rebuild-only-on-change mutator once, generated from a macro list.
 
-Reify the mid-level as a value: a **pipeline of loop-nest fragments with explicit
-call edges and explicit region parameters**.
+Two deliberate improvements over Halide: use interned structured symbols
+({function, stage, var, role}) with a printable form instead of raw strings
+with suffix matching; and make the bounds contract an explicit data structure
+(§9.3) rather than dangling names.
+
+**2. The simplifier (~the biggest single investment).** Constant folding; let
+substitution and dead-let removal; the algebraic rules for min/max/div/mod
+and comparisons; and bounds-aware pruning (prove branches dead from variable
+ranges). Every other component leans on it — Halide's fills several
+Simplify_*.cpp files for good reason, and output quality tracks simplifier
+quality almost linearly. Budget accordingly.
+
+**3. Interval arithmetic and boxes (~400 lines).** `bounds_of_expr_in_scope`
+with symbolic, possibly-infinite endpoints; boxes_required/provided over
+statements; interval union. Handle correlated differences at least crudely, or
+allocation bounds will balloon.
+
+**4. The front end (~500 lines).** Function = {name, args, pure Definition,
+update Definitions, FuncSchedule}; Definition = {args, values, predicate,
+StageSchedule}; the two purity checks (§3.2, §3.3); RDom as a list of
+(name, min, extent) plus predicate. Schedule structs exactly as in §4:
+directive = metadata edit; tile = two splits + reorder; vectorize(x, n) =
+split + mark.
+
+**5. Phase 1 (~600 lines).** Realization order (toposort). Inline pure
+functions scheduled inline. Then per stage: Provide seed → replay splits
+(support RoundUp and GuardWithIf only) → wrap Fors with symbolic bounds.
+Injection: walk the consumer statement; at the compute site wrap
+produce/consume; at the store site wrap Realize. Then bounds inference as in
+§6.2 (or the reified version below), allocation bounds, uniquify, simplify.
+
+**6. Phase 2 (~500 lines + backend).** Storage flattening exactly as §7.1;
+unroll by substitution; vectorize by ramp substitution (require clean divides
+at first — no predication ladder); emit C source as the first backend (a
+direct statement walk), LLVM later if wanted.
+
+### 9.2 What to cut, and what each cut costs
+
+Cut without much loss for research purposes: specializations, compute_with,
+async/ring buffers, memoization, extern stages, GPU, tracing/profiling,
+rfactor and the associativity prover (lose parallel reductions), the exotic
+tail strategies, `Func::in` wrappers. Loop partitioning can wait — boundary
+branches will cost until it exists.
+
+Keep, non-negotiably: the two-layer IR with a shared expression language;
+schedule-as-data with the ordered split log and innermost-first dims list; the
+Provide/Realize/Call mid-level; symbolic-then-inferred bounds; interval
+arithmetic; storage flattening as a distinct phase; Euclidean division. Keep
+sliding window + storage folding on the shortlist — they are compact and are
+what make schedules over stencils genuinely interesting.
+
+Pitfalls to pre-empt (all observed in the real codebase): the "no global
+simplification before uniquify" trap; conservative-but-tight interval
+handling of ±∞; inclusive-vs-exclusive loop bound off-by-ones; reduction
+splits must never over-iterate.
+
+### 9.3 One structural upgrade worth making from day one
+
+Even without the full Section 10 proposal: represent each stage's loop nest as
+a value with an explicit *region parameter* — "given the box of f you need,
+here is the statement" — instead of dangling names. Bounds inference then
+becomes visibly a fold that computes each consumer's requirement and applies
+producers to it. Same algorithm, but the contract is a type instead of a
+convention, and every intermediate state is printable and testable.
+
+---
+
+## 10. Proposal: reify the mid-level IR and make phase 1 incremental
+
+### 10.1 The problem, restated
+
+`schedule_functions` does six jobs in one traversal: per-stage loop synthesis;
+specialization trees; compute_with grafting; placement of every function into
+its consumer's nest; the decision to inline instead; and whole-pipeline
+validation. Its output — the only place the mid-level world exists — is a
+single fused statement. You cannot: build one function's loops and look at
+them; test placement separately from synthesis; re-lower one function after a
+schedule change without redoing everything; or write a new placement strategy
+without editing the monolith. Inlining is decided before loops exist, on the
+functional form — and bounds inference then *reimplements* inlining internally
+because inlined functions left no loops to analyze.
+
+The enabling observation (§8): each stage's nest is already, semantically, a
+function from a requested region to a statement, and per-stage synthesis is
+already independent code. What is missing is making that function a *value*.
+
+### 10.2 The design
+
+Introduce a reified mid-level pipeline:
 
 ```
 MidPipeline {
-  fragments: map<StageId, Fragment>
-  order:     realization order / dependence DAG
-  placement: map<FuncId, {compute: Site, store: Site, hoist: Site}>   // from schedule
+  fragments: map<StageId, Fragment>       // one per (function, stage)
+  order:     realization DAG
+  placement: map<FuncId, {compute: Site, store: Site}>   // from the schedule
 }
 
-Fragment {                        // one per (Func, stage) — today's build_provide_loop_nest output
-  id:      StageId                // {func, stage}
-  region:  list<RegionParam>      // REIFIED: today's dangling f.sN.v.min/.max, now formal params
-  body:    Stmt                   //   loop nest; For bounds reference region params;
-                                  //   reads are Call(Halide); writes are Provide
-  requires: map<StageId, BoxExpr> // boxes_required of body in terms of region params
-                                  //   (computable per-fragment, cacheable)
+Fragment {
+  id:       StageId
+  region:   list<RegionParam>     // explicit parameters — today's dangling
+                                  //   f.sN.v.min/.max, made formal
+  body:     Stmt                  // the loop nest; For bounds reference the
+                                  //   region params; reads are Call(Halide),
+                                  //   writes are Provide
+  requires: map<StageId, BoxExpr> // what this fragment needs of each callee,
+                                  //   as a function of its own region params
+                                  //   (computable per-fragment; cacheable)
 }
 
-Site = Root | Inlined | At(StageId, var)   // reified LoopLevel; loops carry stable ids,
-                                            // so matching is structural, not string suffix
+Site = Root | Inlined | At(StageId, loop)   // reified LoopLevel; loops carry
+                                            //   stable ids, not matched by
+                                            //   string suffix
 ```
 
-Lowering then becomes a sequence of small, independently testable rewrites, each of
-which today is a facet of the monolith:
+Lowering becomes a small set of independent, testable rewrites — each of which
+exists today as a facet of the monolith:
 
-1. **`lower_stage(func, stage) → Fragment`** — pure per-stage synthesis. Exists today
-   as `build_provide_loop_nest`; the only change is emitting region params instead of
-   dangling names. Every Func gets loops — including ones that will later be inlined.
-2. **`graft(pipeline, producer, site)`** — replace the site anchor with
-   `Block(produce(producer.body), consume(original))`, and place `Realize` at the
-   store site. This is today's `InjectFunctionRealization` + `inject_stmt`, but as an
-   explicit combinator on the reified value. compute_with becomes a variant
-   combinator: `graft_fused(parent, child, depth)` with the bound-union rule applied
-   locally.
-3. **`bind_regions(pipeline)`** — compositional bounds inference: at each graft
-   point, the consumer fragment's `requires[producer]` (a Box expression over the
-   consumer's own region params and loop vars at that depth) *is* the argument to the
-   producer fragment's region parameters. Multiple consumers = interval union of
-   their arguments. Today's global shadowing-lets pass becomes a fold over the graft
-   tree; today's `FuncValueBounds` and RDom bounds slot in unchanged. (You can keep a
-   single global pass initially — the point is the *contract* is explicit, so the
-   pass is a checker/instantiator, not the sole owner of the semantics.)
-4. **`inline(pipeline, call_site | func)`** — now *optional and late*: since reads
-   are explicit `Call(Halide)` nodes into a still-standing producer fragment,
-   inlining is a mid-level rewrite (substitute the producer's value expression, or —
-   new capability — merge the producer's *loop* into the consumer at matching depth),
-   instead of a frontend-only Expr substitution that must be decided before any loops
-   exist. This directly answers the "first create loops for each Func/stage
-   separately, with explicit calls, and only then optionally inline" goal: step 1
-   always creates the loops; inlining folds a fragment away afterwards.
-5. **`slide/fold/hoist(pipeline, func)`** — sliding window, storage folding, and
-   storage hoisting become fragment-local rewrites of region arguments and Realize
-   extents rather than pattern-matching passes over a global Stmt.
+1. **`lower_stage(function, stage) → Fragment`** — today's
+   `build_provide_loop_nest`, emitting region parameters instead of dangling
+   names. Pure; unit-testable; every function gets loops, including ones that
+   may later be inlined.
+2. **`graft(pipeline, producer, site)`** — today's injection, as an explicit
+   combinator: replace the site with produce/consume blocks, place Realize at
+   the store site. compute_with becomes a sibling combinator with the
+   union-of-bounds rule applied locally.
+3. **`bind_regions(pipeline)`** — bounds inference, now compositional: at each
+   graft point, the consumer's `requires[producer]` (an expression over the
+   consumer's own region params and the loop variables at that depth) *is* the
+   argument bound to the producer's region parameters; multiple consumers
+   union. The subtle shadowing semantics of §6.2 becomes an explicit binding
+   rule. One can keep a single global pass initially — the win is that the
+   contract is a type, so the pass is an instantiator of a visible interface
+   rather than sole owner of undocumented semantics.
+4. **`inline(pipeline, func | call-site)`** — now *optional and late*: since
+   reads are explicit Calls into a still-standing fragment, inlining is a
+   mid-level rewrite (substitute the producer's value expression; or — a new
+   capability — merge the producer's loops into the consumer's at matching
+   depth). This directly realizes the goal of "first build loops for every
+   stage, with explicit calls between them; then, optionally, inline". It also
+   makes *partial* inlining (inline into one consumer, materialize for
+   another) a first-class operation — today that requires the `Func::in`
+   wrapper workaround.
+5. **`slide / fold / hoist(pipeline, func)`** — sliding window and storage
+   folding become fragment-local rewrites of region arguments and Realize
+   extents, instead of pattern matches over one global statement.
 
-Storage flattening and everything after it are unchanged — they already consume
-exactly this level, they just currently receive it fused into one Stmt. `flatten` is
-the eliminator that folds the MidPipeline into today's post-bounds Stmt.
+Storage flattening and everything after it are untouched — they already
+consume exactly this level; `flatten` becomes the eliminator that folds a
+MidPipeline into today's post-bounds statement.
 
-### 8.3 What you gain
+### 10.3 What this buys
 
-- **Incrementality**: change one Func's schedule → re-run `lower_stage` for its
-  stages and re-graft; other fragments (and their cached `requires` boxes) are
-  untouched. Today any schedule change re-runs the entire monolith.
-- **Testability**: per-stage synthesis, grafting, bounds binding, and inlining each
-  get unit tests with small inputs. Today the only observable output is the whole
-  pipeline's Stmt.
-- **Autoscheduler/cost-model access**: the fragment set with explicit `requires`
-  boxes is precisely the structure Halide's autoschedulers rebuild for themselves
-  from the functional layer (e.g. the featurization loop nests in
-  `src/autoschedulers/adams2019`); reifying it removes a whole shadow
-  implementation.
-- **New schedule semantics become combinators**, not monolith surgery: alternative
-  fusion strategies, partial inlining (inline into one consumer, realize for
-  another — today only expressible via `Func::in()` wrappers, which are a frontend
-  workaround for exactly this gap), recompute-vs-store decisions per consumer.
-- **Debuggability**: `.stmt`-style dumps exist *between* every micro-step.
+- **Incrementality**: a schedule change to one function re-runs `lower_stage`
+  for its stages and re-grafts; other fragments and their cached `requires`
+  boxes are unaffected.
+- **Testability**: synthesis, placement, bounds binding, and inlining each get
+  small unit tests; today the only observable is the whole pipeline's output.
+- **A real substrate for autoschedulers**: the fragment set with explicit
+  required-region expressions is essentially the structure Halide's
+  autoschedulers (e.g. `src/autoschedulers/adams2019`) rebuild for themselves
+  from the functional form today; reifying it deletes a shadow implementation.
+- **Extensibility**: new placement/fusion strategies are new combinators, not
+  monolith surgery.
+- **Debuggability**: printable IR between every micro-step.
 
-### 8.4 Design cautions (learned from the current code)
+### 10.4 Cautions, learned from the current code
 
-1. **The shadowing-bounds semantics is the subtle core.** "`g.s0.x.min` means the
-   region handled by the current iterations of enclosing loops" — in the reified
-   design this becomes: a fragment grafted at depth *d* has its region params bound to
-   expressions over the consumer's loop vars outer to *d*. Get this binding rule
-   right first; everything else is engineering.
-2. **Guards must be structural.** Replace the container-sorting/`likely`-hoisting
-   dance with explicit predicate fields on fragments (RDom predicates, GuardWithIf
-   conditions, specialization conditions), consumed directly by bounds binding.
-3. **Specializations multiply fragments** (one per specialization branch, sharing
-   region params). Fine, but the if-chain composition should live in `lower_stage`,
-   not leak into grafting.
-4. **A Func has up to three attachment points** (hoist ⊇ store ⊇ compute) — the Site
-   record needs all three, and the legality rule (all on one root-to-leaf path in the
-   consumer nest, no parallel loop between store and compute) becomes a static check
-   on the placement map instead of a walk over a half-built Stmt
-   (`ComputeLegalSchedules` today).
-5. **Multi-stage Funcs share one Realize** across their stage fragments — the graft
-   of a Func is the graft of an ordered fragment *sequence* under one produce marker.
-6. **compute_with is the hardest customer**: bound-union of fused siblings and the
-   extent-1 child-loop rewrite (§5.4) must be a first-class combinator, or should be
-   descoped initially (it was added to Halide years after the architecture settled,
-   and its bolted-on nature — FusedPairs as derived data living on the *parent's*
-   schedule — shows).
+1. **The binding rule is the subtle core.** "A fragment grafted at depth d has
+   its region parameters bound to expressions over the consumer's loop
+   variables outside d" — get this exactly right first; it is today's
+   shadowing-let semantics, made explicit. Everything else is engineering.
+2. **Make guards structural.** Replace the sort-statements-so-analysis-sees-
+   the-`likely`s dance (§5.3) with explicit predicate fields on fragments,
+   consumed directly by bounds binding.
+3. **Specializations multiply fragments** (one per branch, sharing region
+   parameters); keep that inside `lower_stage`.
+4. **A function has up to three attachment points** (hoisted storage ⊇ storage
+   ⊇ compute); placement legality (all on one root-to-leaf path; no parallel
+   loop between store and compute) becomes a static check on the placement
+   map instead of a walk over a half-built statement.
+5. **Multi-stage functions share one Realize** across their stage fragments —
+   grafting a function grafts an ordered fragment sequence under one produce
+   marker.
+6. **compute_with is the hardest customer** (union bounds; rewriting child
+   loops to single-iteration shells). Make it a first-class combinator or
+   descope it initially; its bolted-on shape in today's code (derived
+   FusedPairs stored on the *parent's* schedule) shows it postdates the
+   architecture.
 
-### 8.5 Precedents
+### 10.5 Precedent
 
-TVM's TensorIR made exactly this move: its `Block` construct reifies stage boundaries
-with explicit read/write region annotations inside imperative IR, so scheduling
-primitives are IR→IR rewrites rather than a lowering interpreter over metadata.
-MLIR's `linalg`/`affine`/`scf` stack demonstrates progressive lowering with each
-level a stable, inspectable dialect. Exo pushes further (scheduling as user-visible
-rewrite rules on imperative IR). Halide's design — schedule as metadata interpreted
-by one big pass — predates all of these; the proposal here is essentially retrofitting
-the TensorIR insight while keeping Halide's front-end ergonomics and its
-interval-arithmetic bounds machinery, which remains best-in-class.
+TVM's TensorIR made exactly this move — its "block" construct reifies stage
+boundaries with explicit read/write region annotations inside imperative IR,
+so scheduling is IR-to-IR rewriting rather than a metadata interpreter. MLIR's
+linalg/affine/scf stack shows progressive lowering through stable, printable
+levels; Exo makes scheduling rewrites user-visible. Halide's
+schedule-as-metadata design predates all of these. The proposal is essentially
+to retrofit that later insight while keeping the two things Halide still does
+best: the front-end ergonomics, and the interval-arithmetic bounds machinery.
 
 ---
 
-## Appendix: key file map
+## Appendix: file map
 
 | Concern | Files |
 |---|---|
-| Expr/Stmt nodes, handles | `Expr.h`, `IR.h/.cpp`, `IntrusivePtr.h`, `Type.h` |
-| Visitors | `IRVisitor.h`, `IRMutator.h` |
-| Functional layer | `Func.h/.cpp`, `Function.h/.cpp`, `FunctionPtr.h`, `Definition.h/.cpp`, `Var.h`, `RDom.h/.cpp`, `Reduction.h/.cpp` |
-| Schedule data | `Schedule.h/.cpp`, `LoopPartitioningDirective.h`, `PrefetchDirective.h` |
-| Driver | `Lower.cpp` (`lower_impl`, pass list) |
-| Environment | `FindCalls.cpp`, `WrapCalls.cpp`, `RealizationOrder.cpp`, `SimplifySpecializations.cpp` |
-| Initial lowering | `ScheduleFunctions.cpp`, `ApplySplit.cpp`, `Inline.cpp` |
-| Bounds | `Bounds.cpp` (interval arithmetic, boxes), `BoundsInference.cpp`, `AllocationBoundsInference.cpp` |
-| Mid→low transition | `SlidingWindow.cpp`, `StorageFolding.cpp`, `SplitTuples.cpp`, `StorageFlattening.cpp`, `UnpackBuffers.cpp`, `AddImageChecks.cpp` |
-| Loop restructuring | `BoundConstantExtentLoops.cpp`, `UnrollLoops.cpp`, `VectorizeLoops.cpp`, `PartitionLoops.cpp`, `TrimNoOps.cpp`, `RebaseLoopsToZero.cpp` |
-| Parallel/async/GPU | `AsyncProducers.cpp`, `LowerParallelTasks.cpp`, `OffloadGPULoops.cpp`, `InjectHostDevBufferCopies.cpp`, `FuseGPUThreadLoops.cpp` |
-| Output | `Module.h`, `CodeGen_LLVM.cpp`, `CodeGen_C.cpp` |
+| Expression/statement nodes | `Expr.h`, `IR.h/.cpp`, `IntrusivePtr.h`, `Type.h` |
+| Traversal | `IRVisitor.h`, `IRMutator.h` |
+| Front end | `Func.h/.cpp`, `Function.h/.cpp`, `FunctionPtr.h`, `Definition.h/.cpp`, `Var.h`, `RDom.h/.cpp`, `Reduction.h/.cpp` |
+| Schedule data | `Schedule.h/.cpp` |
+| Driver and pass order | `Lower.cpp` |
+| Environment/order | `FindCalls.cpp`, `WrapCalls.cpp`, `RealizationOrder.cpp` |
+| Loop building & placement | `ScheduleFunctions.cpp`, `ApplySplit.cpp`, `Inline.cpp` |
+| Bounds machinery | `Bounds.cpp` (intervals, boxes), `BoundsInference.cpp`, `AllocationBoundsInference.cpp` |
+| Region optimizations | `SlidingWindow.cpp`, `StorageFolding.cpp` |
+| Flattening & buffers | `SplitTuples.cpp`, `StorageFlattening.cpp`, `UnpackBuffers.cpp`, `AddImageChecks.cpp` |
+| Loop restructuring | `UnrollLoops.cpp`, `VectorizeLoops.cpp`, `PartitionLoops.cpp` |
+| Parallel/async/GPU | `AsyncProducers.cpp`, `LowerParallelTasks.cpp`, `OffloadGPULoops.cpp` |
+| Output & codegen | `Module.h`, `CodeGen_LLVM.cpp`, `CodeGen_C.cpp` |
